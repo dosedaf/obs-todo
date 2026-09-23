@@ -193,9 +193,6 @@ def set_setting(conn, key: str, value):
 
 # ---------------------------------------------------------------- pomodoro engine
 
-POMO_KEYS = {"pomo_focus_min": 50, "pomo_break_min": 10, "pomo_auto_next": "0"}
-
-
 def pomo_config(conn) -> dict:
     return {
         "focus_min": int(get_setting(conn, "pomo_focus_min", 50)),
@@ -541,7 +538,6 @@ def pomo_summary(conn) -> dict:
         by_hour[int(r["started_at"][11:13])] = by_hour.get(int(r["started_at"][11:13]), 0) + r["minutes"]
 
     dates = sorted(by_day)
-    best_day = max(by_day.items(), key=lambda kv: kv[1]) if by_day else None
     streaks, run, prev = [], 0, None
     for d in dates:
         run = run + 1 if prev and (parse_iso(d) - parse_iso(prev)).days == 1 else 1
@@ -571,9 +567,12 @@ def pomo_summary(conn) -> dict:
         key = f"{y:04d}-{mo:02d}"
         months.append({"label": date(y, mo, 1).strftime("%b"), "min": sum(v for k, v in by_day.items() if k[:7] == key)})
 
-    longest = conn.execute(
-        "SELECT minutes, started_at, task_label FROM pomo_periods ORDER BY minutes DESC LIMIT 1"
-    ).fetchone()
+    today_cats = conn.execute(
+        "SELECT COALESCE(c.name, 'Unallocated') AS name, SUM(p.minutes) AS m "
+        "FROM pomo_periods p LEFT JOIN categories c ON c.id=p.category_id "
+        "WHERE substr(p.started_at,1,10)=? GROUP BY c.name ORDER BY m DESC",
+        (today_str(),),
+    ).fetchall()
 
     return {
         "total_min": total_min,
@@ -581,13 +580,11 @@ def pomo_summary(conn) -> dict:
         "days_accessed": len(dates),
         "streak_current": cur_streak,
         "streak_best": best_streak,
-        "best_day": {"date": best_day[0], "min": best_day[1]} if best_day else None,
         "avg_per_focus_day": round(total_min / len(dates)) if dates else 0,
+        "today_categories": [{"name": r["name"], "min": r["m"]} for r in today_cats],
         "weeks": weeks,
         "months": months,
         "hours": [{"h": h, "min": by_hour.get(h, 0)} for h in range(24)],
-        "longest": {"min": longest["minutes"], "date": longest["started_at"][:10],
-                    "task": longest["task_label"]} if longest else None,
     }
 
 
@@ -615,6 +612,8 @@ PAGE = """<!doctype html>
     overflow: hidden;
     height: calc(100% - 16px);
     box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
   }
   .daynav {
     display: flex;
@@ -635,39 +634,6 @@ PAGE = """<!doctype html>
   .daynav button:hover { color: #eaeaec; border-color: rgba(255,255,255,0.32); }
   .daylabel { font-size: 14px; font-weight: 600; color: #9b9b9e; letter-spacing: 0.4px; }
 
-  .pomo {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 6px 0 10px;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-    margin-bottom: 8px;
-  }
-  .ptime {
-    font-size: 34px;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.5px;
-    line-height: 1.1;
-  }
-  .pomo.running .ptime { color: #ffffff; }
-  .pomo.paused .ptime { color: #9b9b9e; }
-  .pomo.ended .ptime { color: #ffffff; animation: blink 1.1s ease-in-out infinite; }
-  .pomo.ended { border-bottom-color: rgba(255,255,255,0.45); }
-  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .pright { text-align: right; }
-  .pphase {
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    color: #ffffff;
-  }
-  .pomo.paused .pphase { color: #9b9b9e; }
-  .pbreak .pphase { color: #9b9b9e; }
-  .pmeta { font-size: 13px; color: #9b9b9e; margin-top: 2px; white-space: nowrap; }
-
   h1 {
     margin: 0 0 2px;
     font-size: 26px;
@@ -687,7 +653,7 @@ PAGE = """<!doctype html>
     border-radius: 3px;
     background: rgba(255, 255, 255, 0.08);
     overflow: hidden;
-    margin-bottom: 10px;
+    margin-bottom: 6px;
   }
   .bar-fill {
     height: 100%;
@@ -696,6 +662,36 @@ PAGE = """<!doctype html>
     background: #eaeaec;
     transition: width 0.6s ease;
   }
+
+  .pomo {
+    text-align: center;
+    padding: 14px 0 12px;
+    margin-bottom: 4px;
+  }
+  .ptime {
+    font-size: 32px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.5px;
+    line-height: 1.1;
+  }
+  .pomo.running .ptime { color: #ffffff; }
+  .pomo.paused .ptime { color: #9b9b9e; }
+  .pomo.ended .ptime { color: #ffffff; animation: blink 1.1s ease-in-out infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .pphase {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2.5px;
+    color: #9b9b9e;
+    margin-top: 3px;
+  }
+  .pomo.running .pphase { color: #ffffff; }
+  .pomo.ended .pphase { color: #ffffff; }
+  .pmeta { font-size: 11.5px; color: #57575a; margin-top: 3px; }
+
+  .listwrap { flex: 1 1 auto; overflow: hidden; }
   ul { list-style: none; margin: 0; padding: 0; }
   li {
     display: flex;
@@ -716,6 +712,15 @@ PAGE = """<!doctype html>
   .todo .box { color: #57575a; }
   .todo .label { color: #9b9b9e; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .pfoot {
+    flex: none;
+    text-align: center;
+    font-size: 12px;
+    color: #57575a;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
 </style>
 </head>
 <body>
@@ -767,27 +772,20 @@ PAGE = """<!doctype html>
 
   function pomoHtml() {
     if (!pomo) return "";
-    const ms = pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms;
-    const cls = pomo.ended ? "ended" : pomo.running ? "running" : "paused" + (pomo.phase === "break" ? " pbreak" : "");
+    const cls = pomo.ended ? "ended" : pomo.running ? "running" : "paused";
     const bits = [pomo.category ? esc(pomo.category.name) : null, pomo.task ? esc(pomo.task.label) : null].filter(Boolean);
-    const right = [];
-    if (pomo.session) right.push(fmtHM(pomo.session.focused_min) + " session");
-    if (pomo.session && pomo.session.tasks_done) right.push(pomo.session.tasks_done + " task" + (pomo.session.tasks_done > 1 ? "s" : ""));
-    if (pomo.today.focused_min) right.push(fmtHM(pomo.today.focused_min) + " today");
     return `<div class="pomo ${cls}">
-      <div class="ptime">${fmtClock(ms)}</div>
-      <div class="pright">
-        <div class="pphase">${pomo.ended ? pomo.phase + " done" : pomo.phase}</div>
-        <div class="pmeta">${bits.join(" &middot; ")}${right.length ? "<br>" + right.join(" &middot; ") : ""}</div>
-      </div>
+      <div class="ptime">${fmtClock(pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms)}</div>
+      <div class="pphase">${pomo.ended ? pomo.phase + " done" : pomo.phase}</div>
+      ${bits.length ? `<div class="pmeta">${bits.join(" &middot; ")}</div>` : ""}
     </div>`;
   }
 
   function renderTimer() {
-    const el = document.querySelector(".pomo");
+    const el = document.querySelector(".ptime");
     if (!el || !pomo) return;
     const ms = pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms;
-    el.querySelector(".ptime").textContent = fmtClock(ms);
+    el.textContent = fmtClock(ms);
     if (pomo.running && ms <= 0 && !rang) { rang = true; bell(); }
   }
 
@@ -809,13 +807,14 @@ PAGE = """<!doctype html>
           <span class="daylabel">${esc(data.day.label)} &middot; ${idx + 1}/${data.days.length}</span>
           <button onclick="shift(1)">&#9654;</button>
         </div>
-        ${pomoHtml()}
         <h1>${esc(data.day.label)}</h1>
         <div class="stats"><span>${data.stats.done} / ${data.stats.total} done</span><span>${pct}%</span></div>
         <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
-        <ul>` + data.items.filter(i => i.state !== "done").map(i =>
+        ${pomoHtml()}
+        <div class="listwrap"><ul>` + data.items.filter(i => i.state !== "done").map(i =>
           `<li class="${i.state}"><span class="box">${i.state === "doing" ? "&#9679;" : "&#9675;"}</span><span class="label">${esc(i.text)}</span></li>`
-        ).join("") + "</ul>";
+        ).join("") + `</ul></div>
+        <div class="pfoot">${fmtHM(pomo.today.focused_min)} today</div>`;
       document.getElementById("card").innerHTML = html;
     } catch (e) { /* keep last render */ }
   }
@@ -830,7 +829,7 @@ MANAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>todo manage</title>
+<title>obs-todo</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -838,49 +837,62 @@ MANAGE = """<!doctype html>
     background: #161618;
     color: #eaeaec;
     font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-    padding: 22px;
+    padding: 18px 22px 26px;
     max-width: 860px;
     font-size: 14px;
   }
-  h1 { font-size: 20px; margin: 0 0 2px; font-weight: 700; }
-  .hint { color: #9b9b9e; font-size: 12.5px; margin-bottom: 16px; }
-  .vtabs { display: flex; gap: 6px; margin-bottom: 16px; }
-  .vtab {
-    padding: 6px 14px; border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 600;
-    border: 1px solid rgba(255,255,255,0.10); background: none; color: #9b9b9e;
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 18px; padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
   }
-  .vtab:hover { color: #eaeaec; border-color: rgba(255,255,255,0.28); }
-  .vtab.cur { background: #eaeaec; color: #161618; border-color: #eaeaec; }
-  .tabs { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+  .brand { font-size: 15px; font-weight: 700; letter-spacing: 0.3px; }
+  .nlinks button {
+    background: none; border: none; cursor: pointer;
+    color: #9b9b9e; font-size: 13px; margin-left: 18px; padding: 2px 0;
+    border-bottom: 1px solid transparent; font-family: inherit;
+  }
+  .nlinks button:hover { color: #eaeaec; }
+  .nlinks button.cur { color: #ffffff; border-bottom-color: #ffffff; font-weight: 600; }
+
+  .hint { color: #9b9b9e; font-size: 12.5px; margin-bottom: 14px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; align-items: center; }
   .tab {
-    padding: 6px 13px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.10);
-    background: rgba(255,255,255,0.03); color: #9b9b9e; cursor: pointer; font-size: 13px;
+    padding: 5px 10px; border: none; background: none;
+    color: #57575a; cursor: pointer; font-size: 13px; border-radius: 8px;
+    font-family: inherit;
   }
-  .tab.current { background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.35); color: #ffffff; font-weight: 600; }
+  .tab:hover { color: #9b9b9e; }
+  .tab.current {
+    background: #eaeaec; color: #161618; font-weight: 700;
+    padding: 7px 15px; font-size: 13.5px;
+  }
   .tab .edit { opacity: 0.45; margin-left: 7px; font-size: 11px; cursor: text; }
   .tab .edit:hover { opacity: 1; }
+  .tab.current .edit { opacity: 0.6; }
   .tab input.rename {
     background: transparent; border: none; outline: none;
-    border-bottom: 1px solid #ffffff; color: #ffffff;
-    font: inherit; font-weight: 600; width: 90px; padding: 0;
+    border-bottom: 1px solid currentColor; color: inherit;
+    font: inherit; font-weight: 700; width: 90px; padding: 0;
   }
-  .toolbar { display: flex; gap: 7px; margin-bottom: 14px; flex-wrap: wrap; }
-  .tool, button.std {
-    padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.12);
-    background: none; color: #9b9b9e; cursor: pointer; font-size: 12.5px;
-  }
-  .tool:hover, button.std:hover { color: #eaeaec; border-color: rgba(255,255,255,0.30); }
-  .tool.pri, button.pri { background: #eaeaec; color: #161618; border-color: #eaeaec; font-weight: 600; }
-  .tool.pri:hover, button.pri:hover { background: #ffffff; }
-  .tool.danger:hover { color: #ffffff; border-color: #ffffff; }
   .card {
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 12px;
     padding: 10px 14px;
   }
-  .card + .card { margin-top: 12px; }
-  .ctitle { font-size: 11px; color: #57575a; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin: 4px 0 8px; }
+  .bottombar { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+  .bottombar .spacer { flex: 1; }
+  .tool, button.std {
+    padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.12);
+    background: none; color: #9b9b9e; cursor: pointer; font-size: 12.5px;
+    font-family: inherit;
+  }
+  .tool:hover, button.std:hover { color: #eaeaec; border-color: rgba(255,255,255,0.30); }
+  .tool.pri { background: #eaeaec; color: #161618; border-color: #eaeaec; font-weight: 600; }
+  .tool.pri:hover { background: #ffffff; }
+  .tool.danger { color: #57575a; }
+  .tool.danger:hover { color: #ffffff; border-color: #ffffff; }
   .task { border-bottom: 1px solid rgba(255,255,255,0.06); }
   .task:last-child { border-bottom: none; }
   .row { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
@@ -895,8 +907,12 @@ MANAGE = """<!doctype html>
   .todo .ttext { color: #9b9b9e; }
   .doing .ttext { color: #ffffff; font-weight: 600; }
   .done .ttext { color: #57575a; text-decoration: line-through; }
-  .focusbtn { background: none; border: 1px solid rgba(255,255,255,0.14); color: #9b9b9e; border-radius: 7px; font-size: 11px; padding: 3px 8px; cursor: pointer; }
-  .focusbtn:hover, .focusbtn.on { color: #161618; background: #eaeaec; border-color: #eaeaec; }
+  .focusbtn {
+    background: none; border: 1px solid rgba(255,255,255,0.14); color: #57575a;
+    border-radius: 7px; font-size: 11px; padding: 3px 8px; cursor: pointer; font-family: inherit;
+  }
+  .focusbtn:hover { color: #eaeaec; border-color: rgba(255,255,255,0.30); }
+  .focusbtn.on { color: #161618; background: #eaeaec; border-color: #eaeaec; font-weight: 600; }
   .hasnotes { font-size: 10px; color: #57575a; margin-left: 6px; }
   .delbtn { background: none; border: none; color: #57575a; cursor: pointer; font-size: 14px; }
   .delbtn:hover { color: #ffffff; }
@@ -922,18 +938,46 @@ MANAGE = """<!doctype html>
   .saved.show { opacity: 1; }
   .hidden { display: none !important; }
 
-  .pwrap { display: flex; gap: 18px; flex-wrap: wrap; }
-  .pleft { flex: 0 0 300px; }
-  .pright2 { flex: 1; min-width: 280px; }
-  .bigtime { font-size: 52px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 1px; line-height: 1; }
-  .bigtime.run { color: #ffffff; }
-  .bigtime.wait { color: #57575a; }
-  .bigtime.end { color: #ffffff; animation: blink 1.1s ease-in-out infinite; }
+  .tbox {
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.02);
+    border-radius: 16px;
+    min-height: 58vh;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 4px;
+    padding: 30px 20px;
+  }
+  .tphase {
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 3px; color: #9b9b9e;
+  }
+  .ttime {
+    font-size: 46px; font-weight: 700; font-variant-numeric: tabular-nums;
+    letter-spacing: 1px; line-height: 1.1; color: #9b9b9e;
+  }
+  .tbox.run .ttime, .tbox.end .ttime { color: #ffffff; }
+  .tbox.end .ttime { animation: blink 1.1s ease-in-out infinite; }
   @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .pstate { font-size: 11px; text-transform: uppercase; letter-spacing: 2px; color: #9b9b9e; font-weight: 700; margin: 4px 0 14px; }
-  .prow { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tctrl { display: flex; gap: 8px; margin-top: 16px; }
+  .tsum { margin-top: 14px; font-size: 12.5px; color: #57575a; }
+  .tsum b { color: #9b9b9e; font-weight: 600; }
+  details.setdrop { margin-top: 14px; }
+  details.setdrop summary {
+    cursor: pointer; text-align: center; color: #57575a; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 2px; font-weight: 700;
+    padding: 8px; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+    list-style: none;
+  }
+  details.setdrop summary::-webkit-details-marker { display: none; }
+  details.setdrop summary:hover { color: #9b9b9e; }
+  details.setdrop[open] summary { color: #9b9b9e; border-color: rgba(255,255,255,0.20); }
+  .setbody { padding: 16px 4px 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .setcol .ctitle { margin-top: 0; }
+  .ctitle { font-size: 11px; color: #57575a; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin: 4px 0 8px; }
+  .prow { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
   select.tinput { appearance: auto; }
-  .meta { color: #9b9b9e; font-size: 12.5px; margin-top: 10px; line-height: 1.7; }
+  .meta { color: #9b9b9e; font-size: 12.5px; line-height: 1.7; }
   .meta b { color: #eaeaec; font-weight: 600; }
   table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.t th { text-align: left; color: #57575a; font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px; padding: 5px 6px; border-bottom: 1px solid rgba(255,255,255,0.10); }
@@ -941,36 +985,31 @@ MANAGE = """<!doctype html>
   table.t td.num, table.t th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .imp { color: #9b9b9e; font-size: 12px; margin-top: 8px; white-space: pre-line; }
 
-  .statsgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
-  .stat { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px 14px; }
-  .stat b { display: block; font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .statsgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stat { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px 16px; text-align: center; }
+  .stat b { display: block; font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .stat span { font-size: 10.5px; color: #57575a; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
   .chart { margin-bottom: 18px; }
-  .bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; }
-  .bcol { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative; }
+  .bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; margin-bottom: 16px; }
+  .bcol { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative; min-width: 0; }
   .bcol i { display: block; width: 100%; background: #3f3f43; border-radius: 3px 3px 0 0; min-height: 1px; }
   .bcol:hover i { background: #eaeaec; }
   .bcol b { font-size: 9.5px; color: #9b9b9e; font-weight: 600; margin-bottom: 2px; font-variant-numeric: tabular-nums; }
-  .bcol s { text-decoration: none; font-size: 9px; color: #57575a; margin-top: 4px; position: absolute; bottom: -14px; white-space: nowrap; }
-  .bars { margin-bottom: 16px; }
+  .bcol s { text-decoration: none; font-size: 9px; color: #57575a; margin-top: 4px; position: absolute; bottom: -14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 </style>
 </head>
 <body>
-<h1>todo manage</h1>
-<div class="hint">Day tabs select AND push to the stream overlay. &#9998; renames a day. Timer binds tasks and logs focus periods automatically.</div>
-<div class="vtabs">
-  <button class="vtab cur" data-v="tasks" onclick="switchView('tasks')">Tasks</button>
-  <button class="vtab" data-v="timer" onclick="switchView('timer')">Timer</button>
-  <button class="vtab" data-v="log" onclick="switchView('log')">Log</button>
-  <button class="vtab" data-v="summary" onclick="switchView('summary')">Summary</button>
-</div>
+<nav class="nav">
+  <span class="brand">obs-todo</span>
+  <span class="nlinks">
+    <button data-v="tasks" class="cur" onclick="switchView('tasks')">tasks</button>
+    <button data-v="timer" onclick="switchView('timer')">timer</button>
+    <button data-v="summary" onclick="switchView('summary')">summary</button>
+    <button data-v="log" onclick="switchView('log')">log</button>
+  </span>
+</nav>
 
 <div id="view-tasks">
-  <div class="toolbar">
-    <button class="tool" onclick="addDay()">+ day</button>
-    <button class="tool" onclick="carry()">carry unfinished &rarr; next day</button>
-    <button class="tool danger" onclick="delDay()">delete day</button>
-  </div>
   <div class="tabs" id="tabs"></div>
   <div class="card"><div id="list"></div>
     <div class="addbar">
@@ -978,56 +1017,81 @@ MANAGE = """<!doctype html>
       <button class="tool pri" onclick="addTask()">add</button>
     </div>
   </div>
+  <div class="bottombar">
+    <button class="tool" onclick="addDay()">+ day</button>
+    <button class="tool" onclick="carry()">carry unfinished &rarr; next day</button>
+    <button class="tool hidden" id="undobtn" onclick="undoCarry()">undo carry</button>
+    <span class="spacer"></span>
+    <button class="tool danger" onclick="delDay()">delete day</button>
+  </div>
 </div>
 
 <div id="view-timer" class="hidden">
-  <div class="card">
-    <div class="pwrap">
-      <div class="pleft">
-        <div class="bigtime" id="bigtime">&ndash;</div>
-        <div class="pstate" id="pstate">&nbsp;</div>
-        <div class="prow">
-          <button class="tool pri" id="btn-start" onclick="pomoAct('start')">start</button>
-          <button class="tool" onclick="pomoAct('pause')">pause</button>
-          <button class="tool" onclick="pomoAct('reset')">reset</button>
-          <button class="tool" onclick="pomoAct('skip')">skip</button>
-        </div>
+  <div class="tbox" id="tbox">
+    <div class="tphase" id="tphase">focus</div>
+    <div class="ttime" id="ttime">&ndash;</div>
+    <div class="tctrl">
+      <button class="tool pri" id="btn-start" onclick="pomoAct('start')">start</button>
+      <button class="tool" onclick="pomoAct('pause')">pause</button>
+      <button class="tool" onclick="pomoAct('reset')">reset</button>
+      <button class="tool" onclick="pomoAct('skip')">skip</button>
+    </div>
+    <div class="tsum" id="tsum">&nbsp;</div>
+  </div>
+  <details class="setdrop">
+    <summary>settings</summary>
+    <div class="setbody">
+      <div class="setcol">
+        <div class="ctitle">context</div>
         <div class="lbl">category</div>
         <div class="prow">
-          <select class="tinput" id="cat" onchange="pomoSet({category_id: this.value ? +this.value : null})" style="flex:1"></select>
+          <select class="tinput" id="cat" onchange="pomoSet({category_id: this.value ? +this.value : null})" style="flex:1; margin-bottom:0"></select>
         </div>
         <div class="prow">
           <input class="tinput" id="newcat" placeholder="new category..." style="flex:1; margin-bottom:0" onkeydown="if(event.key==='Enter')addCategory()">
           <button class="tool" onclick="addCategory()">add</button>
         </div>
-        <div class="lbl" style="margin-top:12px">task (from current day)</div>
+        <div class="lbl" style="margin-top:10px">task (from current day)</div>
         <select class="tinput" id="task" onchange="pomoSet({task_id: this.value ? +this.value : null})"></select>
-      </div>
-      <div class="pright2">
-        <div class="ctitle">session</div>
-        <div class="meta" id="sessmeta">no session</div>
-        <div class="prow" style="margin-top:10px">
+        <div class="ctitle" style="margin-top:14px">session</div>
+        <div class="meta" id="sessmeta" style="margin-bottom:10px">no session</div>
+        <div class="prow">
           <button class="tool" onclick="pomoAct('new_session')">new session</button>
           <button class="tool" onclick="pomoAct('end_session')">end session</button>
         </div>
-        <div class="ctitle" style="margin-top:16px">settings</div>
+      </div>
+      <div class="setcol">
+        <div class="ctitle">timer</div>
         <div class="prow">
           <span class="lbl" style="margin:0 6px 0 0">focus</span><input class="tinput" id="cfg-focus" type="number" min="1" max="600" style="width:70px; margin-bottom:0">
           <span class="lbl" style="margin:0 6px 0 10px">break</span><input class="tinput" id="cfg-break" type="number" min="1" max="600" style="width:70px; margin-bottom:0">
-          <label class="lbl" style="margin:0 6px 0 10px; text-transform:none; letter-spacing:0; font-size:12.5px; color:#9b9b9e"><input type="checkbox" id="cfg-auto"> auto-start next</label>
+        </div>
+        <div class="prow">
+          <label class="lbl" style="margin:0; text-transform:none; letter-spacing:0; font-size:12.5px; color:#9b9b9e"><input type="checkbox" id="cfg-auto"> auto-start next phase</label>
+        </div>
+        <div class="prow">
           <button class="tool" onclick="saveCfg()">save</button>
         </div>
-        <div class="ctitle" style="margin-top:16px">today</div>
-        <div class="meta" id="todaymeta">&ndash;</div>
       </div>
     </div>
+  </details>
+</div>
+
+<div id="view-summary" class="hidden">
+  <div class="statsgrid" id="statgrid"></div>
+  <div class="card">
+    <div class="ctitle">today by category</div>
+    <div class="bars" id="ch-today"></div>
+    <div class="ctitle" style="margin-top:22px">weekly</div>
+    <div class="bars" id="ch-weeks"></div>
+    <div class="ctitle" style="margin-top:22px">monthly</div>
+    <div class="bars" id="ch-months"></div>
   </div>
 </div>
 
 <div id="view-log" class="hidden">
   <div class="card">
     <div class="ctitle">import from pomofocus</div>
-    <div class="hint" style="margin-bottom:8px">Paste the "Focus Time Detail" rows (Date / time range / project / minutes). Re-pasting is safe &mdash; duplicates are skipped.</div>
     <textarea class="ta" id="imptext" placeholder="23-Sep-2026&#10;14:39 ~ 16:56&#10;clickhouse&#10;113"></textarea>
     <div class="prow">
       <button class="tool" onclick="doImport(true)">preview</button>
@@ -1035,21 +1099,9 @@ MANAGE = """<!doctype html>
     </div>
     <div class="imp" id="impout"></div>
   </div>
-  <div class="card">
+  <div class="card" style="margin-top:12px">
     <div class="ctitle">periods</div>
     <div id="logtable" style="max-height:480px; overflow-y:auto"></div>
-  </div>
-</div>
-
-<div id="view-summary" class="hidden">
-  <div class="statsgrid" id="statgrid"></div>
-  <div class="card">
-    <div class="ctitle">last 8 weeks</div>
-    <div class="bars" id="ch-weeks"></div>
-    <div class="ctitle" style="margin-top:20px">last 12 months</div>
-    <div class="bars" id="ch-months"></div>
-    <div class="ctitle" style="margin-top:20px">focus by hour of day</div>
-    <div class="bars" id="ch-hours"></div>
   </div>
 </div>
 
@@ -1059,7 +1111,8 @@ MANAGE = """<!doctype html>
   const $ = id => document.getElementById(id);
   let view = "tasks";
   let days = [], currentDayId = null, selectedId = null, openId = null;
-  let pomo = null, cats = [], logData = null, sumData = null, pomoTimer = null;
+  let pomo = null, logData = null, sumData = null, pomoTimer = null, tickTimer = null, deadline = 0;
+  let catSig = "", taskSig = "", wasEnded = null;
 
   async function api(path, method="GET", body) {
     const opt = {method, headers: {"Content-Type": "application/json"}};
@@ -1076,23 +1129,19 @@ MANAGE = """<!doctype html>
   function fmtHM(min) {
     if (!min) return "0m";
     const h = Math.floor(min / 60), m = min % 60;
-    return (h ? h + "h " : "") + (m ? m + "m" : "");
-  }
-  function hmToClock(min) {
-    const h = Math.floor(min / 60);
-    return h + ":" + String(min % 60).padStart(2, "0");
+    return (h ? h + "h " : "") + (m ? m + "m" : (h ? "" : "0m"));
   }
 
   // ---------- views
   function switchView(v) {
     view = v;
-    document.querySelectorAll(".vtab").forEach(b => b.classList.toggle("cur", b.dataset.v === v));
-    ["tasks","timer","log","summary"].forEach(x => $("view-" + x).classList.toggle("hidden", x !== v));
+    document.querySelectorAll(".nlinks button").forEach(b => b.classList.toggle("cur", b.dataset.v === v));
+    ["tasks","timer","summary","log"].forEach(x => $("view-" + x).classList.toggle("hidden", x !== v));
     if (v === "tasks") load(true);
     if (v === "timer") { startPomoPoll(); }
     else stopPomoPoll();
-    if (v === "log") loadLog();
     if (v === "summary") loadSummary();
+    if (v === "log") loadLog();
   }
 
   // ---------- tasks view
@@ -1103,12 +1152,13 @@ MANAGE = """<!doctype html>
     if (!selectedId || !days.find(d => d.id === selectedId)) selectedId = currentDayId;
     if (!keepOpen) openId = null;
     renderTasks();
+    refreshUndo();
     if (view === "timer") fillTaskSelect();
   }
 
   function renderTasks() {
     $("tabs").innerHTML = days.map(d =>
-      `<button class="tab ${d.id === currentDayId ? "current" : ""}" onclick="selectDay(${d.id})" title="click: select + push to stream">${esc(d.label)}${d.id === currentDayId ? " &#9679;" : ""}<span class="edit" title="rename day" onclick="renameDay(${d.id}, event)">&#9998;</span></button>`
+      `<button class="tab ${d.id === currentDayId ? "current" : ""}" onclick="selectDay(${d.id})" title="click: select + push to stream">${esc(d.label)}${d.id === currentDayId ? `<span class="edit" title="rename day" onclick="renameDay(${d.id}, event)">&#9998;</span>` : ""}</button>`
     ).join("");
     const day = days.find(d => d.id === selectedId);
     const list = $("list");
@@ -1121,7 +1171,7 @@ MANAGE = """<!doctype html>
         <div class="row">
           <button class="statebtn" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</button>
           <span class="ttext" onclick="toggleEditor(${t.id})">${esc(t.text)}${t.details ? '<span class="hasnotes">&#9998;</span>' : ""}</span>
-          <button class="focusbtn" title="bind to timer" onclick="bindTask(${t.id}, this)">&rarr; timer</button>
+          <button class="focusbtn ${pomo && pomo.task && pomo.task.id === t.id ? "on" : ""}" title="bind/unbind to timer" onclick="bindTask(${t.id})">&rarr; timer</button>
           <button class="delbtn" onclick="delTask(${t.id})">&#10005;</button>
         </div>
         <div class="editor ${openId === t.id ? "open" : ""}" id="ed-${t.id}">
@@ -1183,11 +1233,11 @@ MANAGE = """<!doctype html>
     await load(true);
   }
 
-  async function bindTask(id, btn) {
-    document.querySelectorAll(".focusbtn").forEach(b => b.classList.remove("on"));
-    await api("/api/pomodoro", "POST", {action: "set", task_id: id});
-    btn.classList.add("on");
-    if (pomo) renderPomo();
+  async function bindTask(id) {
+    const on = pomo && pomo.task && pomo.task.id === id;
+    pomo = await api("/api/pomodoro", "POST", {action: "set", task_id: on ? null : id});
+    renderTasks();
+    renderPomo();
   }
 
   async function saveTask(id) {
@@ -1235,6 +1285,19 @@ MANAGE = """<!doctype html>
     await load();
   }
 
+  async function refreshUndo() {
+    try {
+      const u = await (await fetch("/api/days/undo-carry")).json();
+      $("undobtn").classList.toggle("hidden", !u.available);
+    } catch (e) {}
+  }
+
+  async function undoCarry() {
+    await api("/api/days/undo-carry", "POST", {});
+    selectedId = null;
+    await load();
+  }
+
   // ---------- timer view
   let actx = null;
   function bell() {
@@ -1265,29 +1328,39 @@ MANAGE = """<!doctype html>
     if (pomoTimer) return;
     pollPomo();
     pomoTimer = setInterval(pollPomo, 1000);
+    if (!tickTimer) tickTimer = setInterval(renderTime, 250);
   }
   function stopPomoPoll() {
     if (pomoTimer) { clearInterval(pomoTimer); pomoTimer = null; }
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
   }
-  let wasEnded = null;
   async function pollPomo() {
     try {
       pomo = await api("/api/pomodoro");
+      deadline = Date.now() + pomo.remaining_ms;
       renderPomo();
       if (pomo.ended && wasEnded === false) bell();
       wasEnded = pomo.ended;
     } catch (e) {}
   }
 
+  function renderTime() {
+    if (!pomo) return;
+    const ms = pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms;
+    $("ttime").textContent = fmtClock(ms);
+  }
+
   async function pomoAct(action) {
     pomo = await api("/api/pomodoro", "POST", {action});
+    deadline = Date.now() + pomo.remaining_ms;
     wasEnded = pomo.ended;
     renderPomo();
-    if (action === "new_session" || action === "end_session") { /* session changed */ }
+    renderTasks();
   }
   async function pomoSet(patch) {
     pomo = await api("/api/pomodoro", "POST", {action: "set", ...patch});
     renderPomo();
+    renderTasks();
   }
   async function addCategory() {
     const el = $("newcat");
@@ -1295,7 +1368,8 @@ MANAGE = """<!doctype html>
     if (!name) return;
     await api("/api/categories", "POST", {name});
     el.value = "";
-    await loadCats();
+    catSig = "";
+    renderPomo();
   }
   async function saveCfg() {
     pomo = await api("/api/pomodoro", "POST", {action: "config",
@@ -1306,44 +1380,75 @@ MANAGE = """<!doctype html>
   }
 
   async function loadCats() {
-    cats = await api("/api/categories");
+    const cats = await api("/api/categories");
     const sel = $("cat");
     if (!sel) return;
-    const cur = pomo?.category?.id ?? null;
+    const sig = JSON.stringify(cats) + "|" + (pomo?.category?.id ?? "");
+    if (sig === catSig) return;
+    catSig = sig;
     sel.innerHTML = `<option value="">Unallocated</option>` + cats.filter(c => c.id).map(c =>
-      `<option value="${c.id}" ${c.id === cur ? "selected" : ""}>${esc(c.name)} &middot; ${fmtHM(c.total_min)}</option>`).join("");
+      `<option value="${c.id}" ${c.id === (pomo?.category?.id ?? null) ? "selected" : ""}>${esc(c.name)}</option>`).join("");
   }
 
   function fillTaskSelect() {
     const sel = $("task");
     if (!sel) return;
     const day = days.find(d => d.id === currentDayId);
-    const cur = pomo?.task?.id ?? null;
     const opts = (day ? day.tasks.filter(t => t.state !== "done") : []);
+    const sig = JSON.stringify(opts.map(t => [t.id, t.text])) + "|" + (pomo?.task?.id ?? "");
+    if (sig === taskSig) return;
+    taskSig = sig;
     sel.innerHTML = `<option value="">no task</option>` + opts.map(t =>
-      `<option value="${t.id}" ${t.id === cur ? "selected" : ""}>${esc(t.text)}</option>`).join("");
+      `<option value="${t.id}" ${t.id === (pomo?.task?.id ?? null) ? "selected" : ""}>${esc(t.text)}</option>`).join("");
   }
 
   function renderPomo() {
     if (!pomo) return;
-    const bt = $("bigtime"), ps = $("pstate"), bs = $("btn-start");
-    if (!bt) return;
-    bt.textContent = fmtClock(pomo.remaining_ms);
-    bt.className = "bigtime " + (pomo.ended ? "end" : pomo.running ? "run" : "wait");
-    ps.textContent = (pomo.phase === "focus" ? "focus" : "break") +
-      (pomo.ended ? " &mdash; done, waiting" : pomo.running ? " &mdash; running" : " &mdash; paused");
-    bs.textContent = pomo.running ? "running..." : pomo.ended || pomo.remaining_ms <= 0 ? "start next" : "start";
+    const tt = $("ttime");
+    if (!tt) return;
+    const box = $("tbox");
+    box.className = "tbox " + (pomo.ended ? "end" : pomo.running ? "run" : "");
+    $("tphase").textContent = pomo.ended ? pomo.phase + " done" : pomo.phase;
+    renderTime();
+    $("btn-start").textContent = pomo.running ? "running" : pomo.ended || pomo.remaining_ms <= 0 ? "start next" : "start";
+    $("tsum").innerHTML = `today <b>${fmtHM(pomo.today.focused_min)}</b>`;
     const sm = $("sessmeta");
     if (pomo.session) {
       const s = pomo.session;
-      sm.innerHTML = `focused <b>${fmtHM(s.focused_min)}</b> &middot; ${s.periods} period${s.periods === 1 ? "" : "s"} &middot; <b>${s.tasks_done}</b> task${s.tasks_done === 1 ? "" : "s"} closed &middot; since ${esc(s.started_at.replace("T", " ").slice(0, 16))}`;
+      sm.innerHTML = `focused <b>${fmtHM(s.focused_min)}</b> &middot; ${s.periods} period${s.periods === 1 ? "" : "s"} &middot; <b>${s.tasks_done}</b> task${s.tasks_done === 1 ? "" : "s"} closed`;
     } else sm.textContent = "no session";
-    $("todaymeta").innerHTML = `focused <b>${fmtHM(pomo.today.focused_min)}</b> &middot; ${pomo.today.periods} period${pomo.today.periods === 1 ? "" : "s"} today`;
     $("cfg-focus").value = pomo.focus_min;
     $("cfg-break").value = pomo.break_min;
     $("cfg-auto").checked = pomo.auto_next;
     loadCats();
     fillTaskSelect();
+  }
+
+  // ---------- summary view
+  async function loadSummary() {
+    sumData = await api("/api/pomodoro/summary");
+    const s = sumData;
+    const stats = [
+      [fmtHM(s.total_min), "total focused"],
+      [fmtHM(s.avg_per_focus_day), "average focused"],
+      [s.streak_current + "d", "current streak"],
+    ];
+    $("statgrid").innerHTML = stats.map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
+    drawBars($("ch-today"), s.today_categories.map(c => ({l: c.name, v: c.min})));
+    drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
+    drawBars($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
+  }
+  function drawBars(el, data) {
+    if (!data.length) { el.innerHTML = `<div class="empty">no data</div>`; return; }
+    const max = Math.max(1, ...data.map(d => d.v));
+    el.innerHTML = data.map(d => {
+      const pct = Math.round(100 * d.v / max);
+      return `<div class="bcol" title="${esc(d.l)}: ${fmtHM(d.v)}">
+        ${d.v ? `<b>${fmtHM(d.v)}</b>` : ""}
+        <i style="height:${pct}%"></i>
+        <s>${esc(d.l)}</s>
+      </div>`;
+    }).join("");
   }
 
   // ---------- log view
@@ -1373,44 +1478,12 @@ MANAGE = """<!doctype html>
     const res = await api("/api/pomodoro/import", "POST", {text, dry_run: dry});
     if (dry) {
       out.textContent = `parsed ${res.parsed} rows.\n` + res.preview.map(r =>
-        `${r.start.slice(0, 10)}  ${r.start.slice(11, 16)}~${r.end.slice(11, 16)}  ${r.project.padEnd(18)} ${r.minutes}m`).join("\\n") +
-        (res.parsed > res.preview.length ? `\\n... and ${res.parsed - res.preview.length} more` : "");
+        `${r.start.slice(0, 10)}  ${r.start.slice(11, 16)}~${r.end.slice(11, 16)}  ${r.project.padEnd(18)} ${r.minutes}m`).join("\n") +
+        (res.parsed > res.preview.length ? `\n... and ${res.parsed - res.preview.length} more` : "");
     } else {
       out.textContent = `imported ${res.imported}, skipped ${res.skipped} (duplicates) of ${res.parsed} parsed.`;
       await loadLog();
     }
-  }
-
-  // ---------- summary view
-  async function loadSummary() {
-    sumData = await api("/api/pomodoro/summary");
-    const s = sumData;
-    const stats = [
-      [fmtHM(s.total_min), "total focused"],
-      [hmToClock(s.total_min) + " h", "total (h:mm)"],
-      [s.total_periods, "focus periods"],
-      [s.days_accessed, "days accessed"],
-      [s.streak_current + "d", "current streak"],
-      [s.streak_best + "d", "best streak"],
-      [fmtHM(s.avg_per_focus_day), "avg / focus day"],
-      [s.best_day ? fmtHM(s.best_day.min) : "0m", "best day" + (s.best_day ? " (" + s.best_day.date.slice(5) + ")" : "")],
-      [s.longest ? s.longest.min + "m" : "0m", "longest period"],
-    ];
-    $("statgrid").innerHTML = stats.map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
-    drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
-    drawBars($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
-    drawBars($("ch-hours"), s.hours.map(h => ({l: h.h % 3 === 0 ? String(h.h) : "", v: h.min})));
-  }
-  function drawBars(el, data) {
-    const max = Math.max(1, ...data.map(d => d.v));
-    el.innerHTML = data.map(d => {
-      const pct = Math.round(100 * d.v / max);
-      return `<div class="bcol" title="${d.l ? d.l + ": " : ""}${fmtHM(d.v)}">
-        ${d.v ? `<b>${fmtHM(d.v)}</b>` : ""}
-        <i style="height:${pct}%"></i>
-        <s>${d.l}</s>
-      </div>`;
-    }).join("");
   }
 
   load();
@@ -1460,6 +1533,8 @@ def make_handler(db_path: str):
                     self._json(200, payload)
                 elif path == "/api/days":
                     self._json(200, manage_payload(conn))
+                elif path == "/api/days/undo-carry":
+                    self._json(200, {"available": bool(get_setting(conn, "last_carry"))})
                 elif path == "/api/pomodoro":
                     self._json(200, pomo_payload(conn))
                 elif path == "/api/pomodoro/log":
@@ -1510,6 +1585,23 @@ def make_handler(db_path: str):
                 if self.path == "/api/days":
                     day = create_day(conn, (body.get("label") or "").strip() or None)
                     self._json(201, {"id": day["id"], "label": day["label"]})
+                elif self.path == "/api/days/undo-carry":
+                    raw = get_setting(conn, "last_carry")
+                    if not raw:
+                        return self._json(400, {"error": "nothing to undo"})
+                    try:
+                        snap = json.loads(raw)
+                    except json.JSONDecodeError:
+                        return self._json(400, {"error": "corrupt snapshot"})
+                    restored = 0
+                    for t in snap.get("tasks", []):
+                        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (t["id"],)).fetchone():
+                            conn.execute("UPDATE tasks SET day_id=?, position=? WHERE id=?",
+                                         (t["day_id"], t["position"], t["id"]))
+                            restored += 1
+                    set_setting(conn, "last_carry", "")
+                    conn.commit()
+                    self._json(200, {"restored": restored})
                 elif self.path == "/api/current-day":
                     day = conn.execute("SELECT id FROM days WHERE id=?", (body.get("day_id"),)).fetchone()
                     if not day:
@@ -1535,7 +1627,7 @@ def make_handler(db_path: str):
                     self._json(200, pomo_action(conn, action, body))
                 elif self.path == "/api/pomodoro/import":
                     self._json(200, import_pomofocus(conn, body.get("text") or "", bool(body.get("dry_run"))))
-                elif path == "/api/categories":
+                elif self.path == "/api/categories":
                     name = (body.get("name") or "").strip()
                     if not name:
                         return self._json(400, {"error": "name required"})
@@ -1555,18 +1647,22 @@ def make_handler(db_path: str):
                     ).fetchone()
                     if not nxt:
                         nxt = create_day(conn)
-                    unfinished = conn.execute(
-                        "SELECT id FROM tasks WHERE day_id=? AND state!='done' ORDER BY position",
+                    src_rows = conn.execute(
+                        "SELECT id, day_id, position FROM tasks WHERE day_id=? AND state!='done' ORDER BY position",
                         (day_id,),
                     ).fetchall()
+                    set_setting(conn, "last_carry", json.dumps({
+                        "to_day": nxt["id"],
+                        "tasks": [{"id": t["id"], "day_id": t["day_id"], "position": t["position"]} for t in src_rows],
+                    }))
                     base = next_position(conn, nxt["id"])
-                    for n, t in enumerate(unfinished):
+                    for n, t in enumerate(src_rows):
                         conn.execute(
                             "UPDATE tasks SET day_id=?, position=? WHERE id=?",
                             (nxt["id"], base + n, t["id"]),
                         )
                     conn.commit()
-                    self._json(200, {"moved": len(unfinished), "moved_to": nxt["id"]})
+                    self._json(200, {"moved": len(src_rows), "moved_to": nxt["id"]})
                 else:
                     self._json(404, {"error": "not found"})
             except ValueError as e:
