@@ -1,0 +1,13 @@
+[Unit]
+Description=OBS todo overlay server
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/obs-todo
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 server.py --port 8787
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
