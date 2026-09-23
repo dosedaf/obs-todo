@@ -634,12 +634,6 @@ PAGE = """<!doctype html>
   .daynav button:hover { color: #eaeaec; border-color: rgba(255,255,255,0.32); }
   .daylabel { font-size: 14px; font-weight: 600; color: #9b9b9e; letter-spacing: 0.4px; }
 
-  h1 {
-    margin: 0 0 2px;
-    font-size: 26px;
-    font-weight: 700;
-    letter-spacing: 0.2px;
-  }
   .stats {
     display: flex;
     align-items: center;
@@ -648,20 +642,6 @@ PAGE = """<!doctype html>
     color: #9b9b9e;
     margin-bottom: 6px;
   }
-  .bar {
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(255, 255, 255, 0.08);
-    overflow: hidden;
-    margin-bottom: 6px;
-  }
-  .bar-fill {
-    height: 100%;
-    width: 0;
-    border-radius: 3px;
-    background: #eaeaec;
-    transition: width 0.6s ease;
-  }
 
   .pomo {
     text-align: center;
@@ -669,7 +649,7 @@ PAGE = """<!doctype html>
     margin-bottom: 4px;
   }
   .ptime {
-    font-size: 32px;
+    font-size: 46px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: 0.5px;
@@ -689,7 +669,6 @@ PAGE = """<!doctype html>
   }
   .pomo.running .pphase { color: #ffffff; }
   .pomo.ended .pphase { color: #ffffff; }
-  .pmeta { font-size: 11.5px; color: #57575a; margin-top: 3px; }
 
   .listwrap { flex: 1 1 auto; overflow: hidden; }
   ul { list-style: none; margin: 0; padding: 0; }
@@ -716,11 +695,13 @@ PAGE = """<!doctype html>
   .pfoot {
     flex: none;
     text-align: center;
-    font-size: 12px;
-    color: #57575a;
-    padding-top: 8px;
-    border-top: 1px solid rgba(255,255,255,0.06);
+    padding-top: 10px;
   }
+  .pfocus { font-size: 13px; font-weight: 600; color: #ffffff; letter-spacing: 0.5px; }
+  .pdone { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 7px; }
+  .pdone .seg { flex: 1; height: 1px; background: rgba(255,255,255,0.16); position: relative; }
+  .pdone .seg i { position: absolute; left: 0; top: -1px; height: 3px; border-radius: 1.5px; background: #ffffff; }
+  .pdone b { font-size: 11px; font-weight: 600; color: #9b9b9e; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -773,12 +754,19 @@ PAGE = """<!doctype html>
   function pomoHtml() {
     if (!pomo) return "";
     const cls = pomo.ended ? "ended" : pomo.running ? "running" : "paused";
-    const bits = [pomo.category ? esc(pomo.category.name) : null, pomo.task ? esc(pomo.task.label) : null].filter(Boolean);
     return `<div class="pomo ${cls}">
       <div class="ptime">${fmtClock(pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms)}</div>
       <div class="pphase">${pomo.ended ? pomo.phase + " done" : pomo.phase}</div>
-      ${bits.length ? `<div class="pmeta">${bits.join(" &middot; ")}</div>` : ""}
     </div>`;
+  }
+
+  function pfootHtml() {
+    if (!pomo) return "";
+    const total = data.stats.total, done = data.stats.done;
+    const pct = total ? Math.round(100 * done / total) : 0;
+    const lw = Math.min(pct, 50) * 2, rw = Math.max(0, pct - 50) * 2;
+    return `<div class="pfocus">${fmtHM(pomo.today.focused_min)}</div>
+      <div class="pdone"><span class="seg"><i style="width:${lw}%"></i></span><b>${done}/${total}</b><span class="seg"><i style="width:${rw}%"></i></span></div>`;
   }
 
   function renderTimer() {
@@ -807,14 +795,12 @@ PAGE = """<!doctype html>
           <span class="daylabel">${esc(data.day.label)} &middot; ${idx + 1}/${data.days.length}</span>
           <button onclick="shift(1)">&#9654;</button>
         </div>
-        <h1>${esc(data.day.label)}</h1>
         <div class="stats"><span>${data.stats.done} / ${data.stats.total} done</span><span>${pct}%</span></div>
-        <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
         ${pomoHtml()}
         <div class="listwrap"><ul>` + data.items.filter(i => i.state !== "done").map(i =>
           `<li class="${i.state}"><span class="box">${i.state === "doing" ? "&#9679;" : "&#9675;"}</span><span class="label">${esc(i.text)}</span></li>`
         ).join("") + `</ul></div>
-        <div class="pfoot">${fmtHM(pomo.today.focused_min)} today</div>`;
+        <div class="pfoot">${pfootHtml()}</div>`;
       document.getElementById("card").innerHTML = html;
     } catch (e) { /* keep last render */ }
   }
@@ -1018,11 +1004,11 @@ MANAGE = """<!doctype html>
     </div>
   </div>
   <div class="bottombar">
-    <button class="tool" onclick="addDay()">+ day</button>
-    <button class="tool" onclick="carry()">carry unfinished &rarr; next day</button>
+    <button class="tool pri" title="add day" onclick="addDay()">+</button>
+    <button class="tool" title="carry unfinished to next day" onclick="carry()">&rarr;</button>
     <button class="tool hidden" id="undobtn" onclick="undoCarry()">undo carry</button>
     <span class="spacer"></span>
-    <button class="tool danger" onclick="delDay()">delete day</button>
+    <button class="tool danger" title="delete day" onclick="delDay()">&#128465;</button>
   </div>
 </div>
 
@@ -1042,18 +1028,7 @@ MANAGE = """<!doctype html>
     <summary>settings</summary>
     <div class="setbody">
       <div class="setcol">
-        <div class="ctitle">context</div>
-        <div class="lbl">category</div>
-        <div class="prow">
-          <select class="tinput" id="cat" onchange="pomoSet({category_id: this.value ? +this.value : null})" style="flex:1; margin-bottom:0"></select>
-        </div>
-        <div class="prow">
-          <input class="tinput" id="newcat" placeholder="new category..." style="flex:1; margin-bottom:0" onkeydown="if(event.key==='Enter')addCategory()">
-          <button class="tool" onclick="addCategory()">add</button>
-        </div>
-        <div class="lbl" style="margin-top:10px">task (from current day)</div>
-        <select class="tinput" id="task" onchange="pomoSet({task_id: this.value ? +this.value : null})"></select>
-        <div class="ctitle" style="margin-top:14px">session</div>
+        <div class="ctitle">session</div>
         <div class="meta" id="sessmeta" style="margin-bottom:10px">no session</div>
         <div class="prow">
           <button class="tool" onclick="pomoAct('new_session')">new session</button>
@@ -1112,7 +1087,7 @@ MANAGE = """<!doctype html>
   let view = "tasks";
   let days = [], currentDayId = null, selectedId = null, openId = null;
   let pomo = null, logData = null, sumData = null, pomoTimer = null, tickTimer = null, deadline = 0;
-  let catSig = "", taskSig = "", wasEnded = null;
+  let wasEnded = null;
 
   async function api(path, method="GET", body) {
     const opt = {method, headers: {"Content-Type": "application/json"}};
@@ -1153,7 +1128,6 @@ MANAGE = """<!doctype html>
     if (!keepOpen) openId = null;
     renderTasks();
     refreshUndo();
-    if (view === "timer") fillTaskSelect();
   }
 
   function renderTasks() {
@@ -1357,49 +1331,12 @@ MANAGE = """<!doctype html>
     renderPomo();
     renderTasks();
   }
-  async function pomoSet(patch) {
-    pomo = await api("/api/pomodoro", "POST", {action: "set", ...patch});
-    renderPomo();
-    renderTasks();
-  }
-  async function addCategory() {
-    const el = $("newcat");
-    const name = el.value.trim();
-    if (!name) return;
-    await api("/api/categories", "POST", {name});
-    el.value = "";
-    catSig = "";
-    renderPomo();
-  }
   async function saveCfg() {
     pomo = await api("/api/pomodoro", "POST", {action: "config",
       focus_min: parseInt($("cfg-focus").value, 10),
       break_min: parseInt($("cfg-break").value, 10),
       auto_next: $("cfg-auto").checked});
     renderPomo();
-  }
-
-  async function loadCats() {
-    const cats = await api("/api/categories");
-    const sel = $("cat");
-    if (!sel) return;
-    const sig = JSON.stringify(cats) + "|" + (pomo?.category?.id ?? "");
-    if (sig === catSig) return;
-    catSig = sig;
-    sel.innerHTML = `<option value="">Unallocated</option>` + cats.filter(c => c.id).map(c =>
-      `<option value="${c.id}" ${c.id === (pomo?.category?.id ?? null) ? "selected" : ""}>${esc(c.name)}</option>`).join("");
-  }
-
-  function fillTaskSelect() {
-    const sel = $("task");
-    if (!sel) return;
-    const day = days.find(d => d.id === currentDayId);
-    const opts = (day ? day.tasks.filter(t => t.state !== "done") : []);
-    const sig = JSON.stringify(opts.map(t => [t.id, t.text])) + "|" + (pomo?.task?.id ?? "");
-    if (sig === taskSig) return;
-    taskSig = sig;
-    sel.innerHTML = `<option value="">no task</option>` + opts.map(t =>
-      `<option value="${t.id}" ${t.id === (pomo?.task?.id ?? null) ? "selected" : ""}>${esc(t.text)}</option>`).join("");
   }
 
   function renderPomo() {
@@ -1420,8 +1357,6 @@ MANAGE = """<!doctype html>
     $("cfg-focus").value = pomo.focus_min;
     $("cfg-break").value = pomo.break_min;
     $("cfg-auto").checked = pomo.auto_next;
-    loadCats();
-    fillTaskSelect();
   }
 
   // ---------- summary view
