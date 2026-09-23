@@ -1477,9 +1477,9 @@ MANAGE = """<!doctype html>
     if (!text.trim()) { out.textContent = "nothing to import"; return; }
     const res = await api("/api/pomodoro/import", "POST", {text, dry_run: dry});
     if (dry) {
-      out.textContent = `parsed ${res.parsed} rows.\n` + res.preview.map(r =>
-        `${r.start.slice(0, 10)}  ${r.start.slice(11, 16)}~${r.end.slice(11, 16)}  ${r.project.padEnd(18)} ${r.minutes}m`).join("\n") +
-        (res.parsed > res.preview.length ? `\n... and ${res.parsed - res.preview.length} more` : "");
+      out.textContent = `parsed ${res.parsed} rows.\\n` + res.preview.map(r =>
+        `${r.start.slice(0, 10)}  ${r.start.slice(11, 16)}~${r.end.slice(11, 16)}  ${r.project.padEnd(18)} ${r.minutes}m`).join("\\n") +
+        (res.parsed > res.preview.length ? `\\n... and ${res.parsed - res.preview.length} more` : "");
     } else {
       out.textContent = `imported ${res.imported}, skipped ${res.skipped} (duplicates) of ${res.parsed} parsed.`;
       await loadLog();
