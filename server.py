@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS pomo_sessions (
 CREATE TABLE IF NOT EXISTS pomo_periods (
     id          INTEGER PRIMARY KEY,
     session_id  INTEGER REFERENCES pomo_sessions(id) ON DELETE SET NULL,
+    day_id      INTEGER REFERENCES days(id) ON DELETE SET NULL,
     category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
     task_id     INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
     task_label  TEXT NOT NULL DEFAULT '',
@@ -100,6 +101,13 @@ def init_db(db_path: str, seed_file: str | None):
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(pomo_sessions)")]
     if "tasks_done" not in cols:
         conn.execute("ALTER TABLE pomo_sessions ADD COLUMN tasks_done INTEGER NOT NULL DEFAULT 0")
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(pomo_periods)")]
+    if "day_id" not in cols:
+        conn.execute("ALTER TABLE pomo_periods ADD COLUMN day_id INTEGER REFERENCES days(id) ON DELETE SET NULL")
+    conn.execute(
+        "UPDATE pomo_periods SET day_id=? WHERE source='timer' AND day_id IS NULL",
+        (current_day_id(conn),),
+    )
     if conn.execute("SELECT COUNT(*) FROM days").fetchone()[0] == 0:
         cur = conn.execute("INSERT INTO days (label, position) VALUES ('Day 1', 1)")
         day_id = cur.lastrowid
@@ -216,10 +224,9 @@ def default_pomo_state(cfg: dict) -> dict:
         "started_at": None,
         "elapsed_ms": 0,
         "duration_min": cfg["focus_min"],
-        "session_id": None,
         "category_id": None,
-        "task_id": None,
-        "task_label": "",
+        "block_category_id": None,
+        "block_day_id": None,
         "phase_started_at": None,
         "logged_ms": 0,
     }
@@ -262,33 +269,18 @@ def new_phase(conn, st: dict, phase: str, running: bool) -> dict:
     return st
 
 
-def ensure_session(conn, st: dict, category_id=None):
-    if st.get("session_id"):
-        row = conn.execute("SELECT id FROM pomo_sessions WHERE id=?", (st["session_id"],)).fetchone()
-        if row:
-            return st["session_id"]
-    cur = conn.execute(
-        "INSERT INTO pomo_sessions (category_id, started_at) VALUES (?,?)",
-        (category_id if category_id is not None else st.get("category_id"), now_iso()),
-    )
-    st["session_id"] = cur.lastrowid
-    if category_id is not None:
-        st["category_id"] = category_id
-    return st["session_id"]
-
-
 def log_period(conn, st: dict, minutes: int, started_at: str, ended_at: str):
-    task_label = st.get("task_label") or ""
-    if st.get("task_id"):
-        row = conn.execute("SELECT text FROM tasks WHERE id=?", (st["task_id"],)).fetchone()
-        if row:
-            task_label = row["text"]
+    cat = st.get("block_category_id")
+    if cat is None:
+        cat = st.get("category_id")
+    day = st.get("block_day_id")
+    if day is None:
+        day = current_day_id(conn)
     conn.execute(
         "INSERT OR IGNORE INTO pomo_periods "
-        "(session_id, category_id, task_id, task_label, minutes, started_at, ended_at, source) "
-        "VALUES (?,?,?,?,?,?,?, 'timer')",
-        (st.get("session_id"), st.get("category_id"), st.get("task_id"), task_label,
-         minutes, started_at, ended_at),
+        "(session_id, day_id, category_id, task_id, task_label, minutes, started_at, ended_at, source) "
+        "VALUES (?,?,?,?,?,?,?,?, 'timer')",
+        (None, day, cat, None, "", minutes, started_at, ended_at),
     )
 
 
@@ -318,21 +310,6 @@ def notify_phase(phase: str):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-
-
-def close_session(conn, st: dict):
-    """End the open session and freeze its tasks-done count."""
-    if st.get("session_id"):
-        row = conn.execute("SELECT started_at FROM pomo_sessions WHERE id=?", (st["session_id"],)).fetchone()
-        if row:
-            n = conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND done_at>=?",
-                (row["started_at"],),
-            ).fetchone()[0]
-            conn.execute(
-                "UPDATE pomo_sessions SET ended_at=COALESCE(ended_at,?), tasks_done=? WHERE id=?",
-                (now_iso(), n, st["session_id"]),
-            )
 
 
 def pomo_tick(conn) -> dict:
@@ -372,34 +349,6 @@ def pomo_payload(conn) -> dict:
         if row:
             category = {"id": row["id"], "name": row["name"]}
 
-    task_label = st.get("task_label") or ""
-    if st.get("task_id"):
-        row = conn.execute("SELECT text FROM tasks WHERE id=?", (st["task_id"],)).fetchone()
-        if row:
-            task_label = row["text"]
-
-    session = None
-    if st.get("session_id"):
-        row = conn.execute(
-            "SELECT id, started_at, ended_at, tasks_done FROM pomo_sessions WHERE id=?",
-            (st["session_id"],),
-        ).fetchone()
-        if row:
-            agg = conn.execute(
-                "SELECT COALESCE(SUM(minutes),0), COUNT(*) FROM pomo_periods WHERE session_id=?",
-                (row["id"],),
-            ).fetchone()
-            done = row["tasks_done"]
-            if row["ended_at"] is None:
-                done = conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND done_at>=?",
-                    (row["started_at"],),
-                ).fetchone()[0]
-            session = {
-                "id": row["id"], "started_at": row["started_at"],
-                "focused_min": agg[0], "periods": agg[1], "tasks_done": done,
-            }
-
     today = conn.execute(
         "SELECT COALESCE(SUM(minutes),0), COUNT(*) FROM pomo_periods WHERE substr(started_at,1,10)=?",
         (today_str(),),
@@ -421,8 +370,6 @@ def pomo_payload(conn) -> dict:
         "break_min": cfg["break_min"],
         "auto_next": cfg["auto_next"],
         "category": category,
-        "task": {"id": st.get("task_id"), "label": task_label} if task_label or st.get("task_id") else None,
-        "session": session,
         "today": {"focused_min": today_min, "periods": today[1]},
     }
 
@@ -436,10 +383,15 @@ def pomo_action(conn, action: str, body: dict):
             fresh["elapsed_ms"] = 0
             fresh["running"] = False
             st = new_phase(conn, fresh, st["phase"], running=True)
+            st["block_category_id"] = st.get("category_id")
+            st["block_day_id"] = current_day_id(conn)
         else:
             st["running"] = True
             st["started_at"] = now_iso()
-        ensure_session(conn, st)
+            if not int(st.get("elapsed_ms") or 0):
+                # fresh paused phase: stamp picker category + active day onto it
+                st["block_category_id"] = st.get("category_id")
+                st["block_day_id"] = current_day_id(conn)
         save_pomo_state(conn, st)
     elif action == "pause":
         if st["running"]:
@@ -466,39 +418,6 @@ def pomo_action(conn, action: str, body: dict):
                 if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cid,)).fetchone():
                     raise ValueError("category not found")
             st["category_id"] = int(cid) if cid else None
-            if st.get("session_id"):
-                conn.execute("UPDATE pomo_sessions SET category_id=? WHERE id=?",
-                             (st["category_id"], st["session_id"]))
-        if "task_id" in body:
-            tid = body["task_id"]
-            if tid:
-                row = conn.execute("SELECT id, text FROM tasks WHERE id=?", (tid,)).fetchone()
-                if not row:
-                    raise ValueError("task not found")
-                st["task_id"] = row["id"]
-                st["task_label"] = row["text"]
-            else:
-                st["task_id"] = None
-                st["task_label"] = ""
-        save_pomo_state(conn, st)
-    elif action == "new_session":
-        cid = body.get("category_id")
-        if cid:
-            if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cid,)).fetchone():
-                raise ValueError("category not found")
-        log_partial(conn, st)
-        close_session(conn, st)
-        st["session_id"] = None
-        if cid is not None:
-            st["category_id"] = int(cid) if cid else None
-        ensure_session(conn, st)
-        st = new_phase(conn, st, "focus", running=False)
-        save_pomo_state(conn, st)
-    elif action == "end_session":
-        log_partial(conn, st)
-        close_session(conn, st)
-        st["session_id"] = None
-        st = new_phase(conn, st, "focus", running=False)
         save_pomo_state(conn, st)
     elif action == "config":
         cfg = pomo_config(conn)
@@ -669,6 +588,74 @@ def pomo_summary(conn) -> dict:
         "months": months,
         "hours": [{"h": h, "min": by_hour.get(h, 0)} for h in range(24)],
     }
+
+
+# ---------------------------------------------------------------- day card (png)
+
+FONT_DIR = "/usr/share/fonts/julietaula-montserrat-fonts"
+
+
+def _hm(minutes: int) -> str:
+    if not minutes:
+        return "0m"
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    return f"{h}h" if h else f"{m}m"
+
+
+def _card_font(size: int, bold: bool):
+    from PIL import ImageFont
+    name = "Montserrat-Bold.otf" if bold else "Montserrat-Medium.otf"
+    try:
+        return ImageFont.truetype(f"{FONT_DIR}/{name}", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+
+def card_png(conn) -> bytes:
+    """1080x1080 minimalist day card: total focused, tasks done, top category."""
+    import io
+    from PIL import Image, ImageDraw
+
+    today = today_str()
+    focused = conn.execute(
+        "SELECT COALESCE(SUM(minutes),0) FROM pomo_periods WHERE substr(started_at,1,10)=?",
+        (today,),
+    ).fetchone()[0]
+    tasks_done = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND substr(done_at,1,10)=?",
+        (today,),
+    ).fetchone()[0]
+    top = conn.execute(
+        "SELECT COALESCE(c.name,'Unallocated') AS name, SUM(p.minutes) AS m "
+        "FROM pomo_periods p LEFT JOIN categories c ON c.id=p.category_id "
+        "WHERE substr(p.started_at,1,10)=? GROUP BY name ORDER BY m DESC LIMIT 1",
+        (today,),
+    ).fetchone()
+
+    W = H = 1080
+    img = Image.new("RGB", (W, H), "#161618")
+    d = ImageDraw.Draw(img)
+    f_big = _card_font(190, bold=True)
+    f_small = _card_font(46, bold=False)
+
+    def center(text, font, y, fill):
+        w = d.textlength(text, font=font)
+        d.text(((W - w) / 2, y), text, font=font, fill=fill)
+
+    center(_hm(focused), f_big, H / 2 - 155, "#eaeaec")
+    small = f"{tasks_done} tasks"
+    if top and top["m"]:
+        small += f"  ·  {top['name']}"
+    center(small, f_small, H / 2 + 105, "#9b9b9e")
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- pages
@@ -976,12 +963,6 @@ MANAGE = """<!doctype html>
   .todo .ttext { color: #9b9b9e; }
   .doing .ttext { color: #ffffff; font-weight: 600; }
   .done .ttext { color: #57575a; text-decoration: line-through; }
-  .focusbtn {
-    background: none; border: 1px solid rgba(255,255,255,0.14); color: #57575a;
-    border-radius: 7px; font-size: 11px; padding: 3px 8px; cursor: pointer; font-family: inherit;
-  }
-  .focusbtn:hover { color: #eaeaec; border-color: rgba(255,255,255,0.30); }
-  .focusbtn.on { color: #161618; background: #eaeaec; border-color: #eaeaec; font-weight: 600; }
   .hasnotes { font-size: 10px; color: #57575a; margin-left: 6px; }
   .delbtn { background: none; border: none; color: #57575a; cursor: pointer; font-size: 14px; }
   .delbtn:hover { color: #ffffff; }
@@ -1021,6 +1002,18 @@ MANAGE = """<!doctype html>
     font-size: 10.5px; font-weight: 700; text-transform: uppercase;
     letter-spacing: 3px; color: #9b9b9e;
   }
+  .sessrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; max-width: 560px; margin-bottom: 10px; }
+  .sessname { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 2.5px; color: #9b9b9e; }
+  .tctrl select.tinput { width: auto; min-width: 130px; margin-bottom: 0; appearance: auto; }
+  .tctrl { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
+  .tsum { margin-top: 14px; font-size: 12.5px; color: #57575a; }
+  .tsum b { color: #9b9b9e; font-weight: 600; }
+  .srow { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 7px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12.5px; color: #9b9b9e; cursor: pointer; border-radius: 7px; }
+  .srow:hover { background: rgba(255,255,255,0.05); color: #eaeaec; }
+  .srow.cur { color: #ffffff; font-weight: 600; }
+  .srow.cur::after { content: " current"; font-size: 10px; color: #57575a; font-weight: 400; }
+  .srow:last-child { border-bottom: none; }
+  .srow .num { font-variant-numeric: tabular-nums; color: #cfcfd2; }
   .ttime {
     font-size: 46px; font-weight: 700; font-variant-numeric: tabular-nums;
     letter-spacing: 1px; line-height: 1.1; color: #9b9b9e;
@@ -1028,9 +1021,6 @@ MANAGE = """<!doctype html>
   .tbox.run .ttime, .tbox.end .ttime { color: #ffffff; }
   .tbox.end .ttime { animation: blink 1.1s ease-in-out infinite; }
   @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .tctrl { display: flex; gap: 8px; margin-top: 16px; }
-  .tsum { margin-top: 14px; font-size: 12.5px; color: #57575a; }
-  .tsum b { color: #9b9b9e; font-weight: 600; }
   details.setdrop { margin-top: 14px; }
   details.setdrop summary {
     cursor: pointer; text-align: center; color: #57575a; font-size: 12px;
@@ -1041,7 +1031,7 @@ MANAGE = """<!doctype html>
   details.setdrop summary::-webkit-details-marker { display: none; }
   details.setdrop summary:hover { color: #9b9b9e; }
   details.setdrop[open] summary { color: #9b9b9e; border-color: rgba(255,255,255,0.20); }
-  .setbody { padding: 16px 4px 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .setbody { padding: 16px 4px 4px; display: grid; grid-template-columns: 1fr; gap: 16px; }
   .setcol .ctitle { margin-top: 0; }
   .ctitle { font-size: 11px; color: #57575a; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin: 4px 0 8px; }
   .prow { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
@@ -1053,8 +1043,6 @@ MANAGE = """<!doctype html>
   table.t td { padding: 6px; border-bottom: 1px solid rgba(255,255,255,0.05); color: #cfcfd2; }
   table.t td.num, table.t th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .imp { color: #9b9b9e; font-size: 12px; margin-top: 8px; white-space: pre-line; }
-
-  .statsgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
   .stat { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px 16px; text-align: center; }
   .stat b { display: block; font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .stat span { font-size: 10.5px; color: #57575a; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
@@ -1073,9 +1061,8 @@ MANAGE = """<!doctype html>
   .drow .dbar { flex: 1; height: 10px; border-radius: 5px; background: rgba(255,255,255,0.06); display: flex; overflow: hidden; }
   .drow .dbar i { display: block; height: 100%; }
   .drow b { flex: 0 0 56px; text-align: right; font-size: 11px; color: #9b9b9e; font-variant-numeric: tabular-nums; font-weight: 600; }
-  .srow { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12px; color: #9b9b9e; }
-  .srow:last-child { border-bottom: none; }
-  .srow .num { font-variant-numeric: tabular-nums; color: #cfcfd2; }
+
+  .statsgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
 </style>
 </head>
 <body>
@@ -1108,35 +1095,32 @@ MANAGE = """<!doctype html>
 
 <div id="view-timer" class="hidden">
   <div class="tbox" id="tbox">
+    <div class="sessrow">
+      <span class="sessname" id="sessname">&ndash;</span>
+      <button class="tool" onclick="toggleSessions()">sessions</button>
+    </div>
     <div class="tphase" id="tphase">focus</div>
     <div class="ttime" id="ttime">&ndash;</div>
     <div class="tctrl">
+      <select class="tinput" id="cat" onchange="pomoSetCat(this.value ? +this.value : null)"></select>
       <button class="tool pri" id="btn-toggle" onclick="pomoToggle()">start</button>
       <button class="tool" onclick="pomoAct('reset')">reset</button>
       <button class="tool" onclick="pomoAct('skip')">skip</button>
     </div>
     <div class="tsum" id="tsum">&nbsp;</div>
   </div>
+  <div class="card hidden" id="sesspanel" style="margin-top:12px">
+    <div class="prow">
+      <select class="tinput" id="sesssort" onchange="renderSessions()" style="width:auto; margin-bottom:0">
+        <option value="latest">latest added</option>
+        <option value="oldest">oldest first</option>
+      </select>
+    </div>
+    <div id="sesslist" style="max-height:300px; overflow-y:auto"></div>
+  </div>
   <details class="setdrop">
     <summary>settings</summary>
     <div class="setbody">
-      <div class="setcol">
-        <div class="ctitle">session</div>
-        <div class="meta" id="sessmeta" style="margin-bottom:10px">no session</div>
-        <div class="prow">
-          <button class="tool" onclick="pomoAct('new_session')">new session</button>
-          <button class="tool" onclick="pomoAct('end_session')">end session</button>
-        </div>
-        <div class="ctitle" style="margin-top:14px">past sessions</div>
-        <div class="prow">
-          <select class="tinput" id="sesssort" onchange="renderSessions()" style="width:auto; margin-bottom:0">
-            <option value="latest">latest added</option>
-            <option value="oldest">oldest first</option>
-            <option value="longest">longest</option>
-          </select>
-        </div>
-        <div id="sesslist" style="max-height:220px; overflow-y:auto"></div>
-      </div>
       <div class="setcol">
         <div class="ctitle">timer</div>
         <div class="prow">
@@ -1156,6 +1140,9 @@ MANAGE = """<!doctype html>
 
 <div id="view-summary" class="hidden">
   <div class="statsgrid" id="statgrid"></div>
+  <div class="prow">
+    <button class="tool" onclick="dayCard()">today card &rarr; png</button>
+  </div>
   <div class="card">
     <div class="ctitle">last 7 days by category</div>
     <div id="ch-daily"></div>
@@ -1230,6 +1217,8 @@ MANAGE = """<!doctype html>
     if (!keepOpen) openId = null;
     renderTasks();
     refreshUndo();
+    const sn = $("sessname");
+    if (sn) sn.textContent = days.find(d => d.id === currentDayId)?.label || "";
   }
 
   function renderTasks() {
@@ -1247,7 +1236,6 @@ MANAGE = """<!doctype html>
         <div class="row">
           <button class="statebtn" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</button>
           <span class="ttext" onclick="toggleEditor(${t.id})">${esc(t.text)}${t.details ? '<span class="hasnotes">&#9998;</span>' : ""}</span>
-          <button class="focusbtn ${pomo && pomo.task && pomo.task.id === t.id ? "on" : ""}" title="bind/unbind to timer" onclick="bindTask(${t.id})">&rarr; timer</button>
           <button class="delbtn" onclick="delTask(${t.id})">&#10005;</button>
         </div>
         <div class="editor ${openId === t.id ? "open" : ""}" id="ed-${t.id}">
@@ -1307,13 +1295,6 @@ MANAGE = """<!doctype html>
     const next = {todo: "doing", doing: "done", done: "todo"}[state];
     await api(`/api/tasks/${id}`, "PATCH", {state: next});
     await load(true);
-  }
-
-  async function bindTask(id) {
-    const on = pomo && pomo.task && pomo.task.id === id;
-    pomo = await api("/api/pomodoro", "POST", {action: "set", task_id: on ? null : id});
-    renderTasks();
-    renderPomo();
   }
 
   async function saveTask(id) {
@@ -1440,8 +1421,6 @@ MANAGE = """<!doctype html>
     deadline = Date.now() + pomo.remaining_ms;
     wasEnded = pomo.ended;
     renderPomo();
-    renderTasks();
-    if (action === "new_session" || action === "end_session") loadSessions();
   }
   async function saveCfg() {
     pomo = await api("/api/pomodoro", "POST", {action: "config",
@@ -1461,14 +1440,27 @@ MANAGE = """<!doctype html>
     renderTime();
     $("btn-toggle").textContent = pomo.running ? "pause" : pomo.ended || pomo.remaining_ms <= 0 ? "start next" : "start";
     $("tsum").innerHTML = `today <b>${fmtHM(pomo.today.focused_min)}</b>`;
-    const sm = $("sessmeta");
-    if (pomo.session) {
-      const s = pomo.session;
-      sm.innerHTML = `focused <b>${fmtHM(s.focused_min)}</b> &middot; ${s.periods} period${s.periods === 1 ? "" : "s"} &middot; <b>${s.tasks_done}</b> task${s.tasks_done === 1 ? "" : "s"} closed`;
-    } else sm.textContent = "no session";
     $("cfg-focus").value = pomo.focus_min;
     $("cfg-break").value = pomo.break_min;
     $("cfg-auto").checked = pomo.auto_next;
+    loadCats();
+  }
+  let catSig = "";
+  async function loadCats() {
+    const cats = await api("/api/categories");
+    const sel = $("cat");
+    if (!sel) return;
+    const sig = JSON.stringify(cats) + "|" + (pomo && pomo.category ? pomo.category.id : "");
+    if (sig === catSig) return;
+    catSig = sig;
+    const cur = pomo && pomo.category ? pomo.category.id : null;
+    sel.innerHTML = `<option value="">Unallocated</option>` + cats.filter(c => c.id).map(c =>
+      `<option value="${c.id}" ${c.id === cur ? "selected" : ""}>${esc(c.name)}</option>`).join("");
+  }
+  async function pomoSetCat(v) {
+    pomo = await api("/api/pomodoro", "POST", {action: "set", category_id: v});
+    catSig = "";
+    loadCats();
   }
 
   // ---------- summary view
@@ -1485,6 +1477,7 @@ MANAGE = """<!doctype html>
     drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
     drawBars($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
   }
+  function dayCard() { window.open("/card.png", "_blank"); }
   function drawDaily(el, days) {
     const cats = [];
     days.forEach(d => d.cats.forEach(c => { if (!cats.includes(c.name)) cats.push(c.name); }));
@@ -1513,28 +1506,36 @@ MANAGE = """<!doctype html>
     }).join("");
   }
 
-  // ---------- sessions list
+  // ---------- sessions panel (day tabs as sessions)
   let sessions = [];
   async function loadSessions() {
     try {
-      sessions = await api("/api/pomodoro/sessions");
+      sessions = await api("/api/sessions");
       renderSessions();
     } catch (e) {}
+  }
+  function toggleSessions() {
+    const p = $("sesspanel");
+    p.classList.toggle("hidden");
+    if (!p.classList.contains("hidden")) loadSessions();
+  }
+  async function switchSession(id) {
+    await api("/api/current-day", "POST", {day_id: id});
+    selectedId = null;
+    await load();
+    loadSessions();
   }
   function renderSessions() {
     const el = $("sesslist");
     if (!el) return;
     const sort = $("sesssort") ? $("sesssort").value : "latest";
-    const cur = pomo && pomo.session ? pomo.session.id : null;
-    const rows = sessions.filter(s => s.id !== cur);
-    rows.sort((a, b) =>
-      sort === "oldest" ? a.started_at.localeCompare(b.started_at)
-      : sort === "longest" ? b.focused_min - a.focused_min
-      : b.started_at.localeCompare(a.started_at));
-    el.innerHTML = rows.map(s => `<div class="srow">
-        <span>${esc(s.started_at.slice(5, 10))} &middot; ${s.started_at.slice(11, 16)} ~ ${s.ended_at ? s.ended_at.slice(11, 16) : "now"}</span>
-        <span class="num">${fmtHM(s.focused_min)} &middot; ${s.periods}p &middot; ${s.tasks_done}t</span>
-      </div>`).join("") || `<div class="empty" style="padding:8px 0">no past sessions</div>`;
+    const rows = [...sessions];
+    rows.sort((a, b) => sort === "oldest" ? a.position - b.position : b.position - a.position);
+    const cur = currentDayId;
+    el.innerHTML = rows.map(s => `<div class="srow ${s.id === cur ? "cur" : ""}" onclick="switchSession(${s.id})">
+        <span>${esc(s.label)}</span>
+        <span class="num">${fmtHM(s.focused_min)} &middot; ${s.blocks} block${s.blocks === 1 ? "" : "s"}</span>
+      </div>`).join("") || `<div class="empty" style="padding:8px 0">no sessions</div>`;
   }
 
   // ---------- log view
@@ -1545,13 +1546,12 @@ MANAGE = """<!doctype html>
       return `<tr>
         <td>${esc(d)}</td><td>${st} ~ ${en}</td>
         <td>${esc(p.category_name || "Unallocated")}</td>
-        <td>${esc(p.task_label || "")}</td>
         <td class="num">${p.minutes}</td>
         <td class="num"><button class="delbtn" onclick="delPeriod(${p.id})">&#10005;</button></td>
       </tr>`;
     }).join("");
     $("logtable").innerHTML = `<table class="t">
-      <tr><th>date</th><th>range</th><th>category</th><th>task</th><th class="num">min</th><th></th></tr>${rows || `<tr><td colspan="6" class="empty">no periods</td></tr>`}</table>`;
+      <tr><th>date</th><th>range</th><th>category</th><th class="num">min</th><th></th></tr>${rows || `<tr><td colspan="5" class="empty">no periods</td></tr>`}</table>`;
   }
   async function delPeriod(id) {
     await api(`/api/pomodoro/periods/${id}`, "DELETE");
@@ -1628,6 +1628,8 @@ def make_handler(db_path: str):
             try:
                 if path == "/":
                     self._send(200, PAGE.encode())
+                elif path == "/card.png":
+                    self._send(200, card_png(conn), "image/png")
                 elif path == "/manage":
                     self._send(200, MANAGE.encode())
                 elif path == "/api/todo":
@@ -1660,26 +1662,18 @@ def make_handler(db_path: str):
                     })
                 elif path == "/api/pomodoro/summary":
                     self._json(200, pomo_summary(conn))
-                elif path == "/api/pomodoro/sessions":
+                elif path == "/api/sessions":
                     rows = conn.execute(
-                        "SELECT s.id, s.started_at, s.ended_at, s.tasks_done, "
-                        "COALESCE((SELECT SUM(p.minutes) FROM pomo_periods p WHERE p.session_id=s.id),0) AS focused_min, "
-                        "COALESCE((SELECT COUNT(*) FROM pomo_periods p WHERE p.session_id=s.id),0) AS periods "
-                        "FROM pomo_sessions s ORDER BY s.started_at DESC LIMIT 100"
+                        "SELECT d.id, d.label, d.position, COUNT(p.id) AS blocks, "
+                        "COALESCE(SUM(p.minutes),0) AS focused_min "
+                        "FROM days d LEFT JOIN pomo_periods p ON p.day_id=d.id "
+                        "GROUP BY d.id ORDER BY d.position DESC"
                     ).fetchall()
-                    out = []
-                    for r in rows:
-                        done = r["tasks_done"]
-                        if r["ended_at"] is None:
-                            done = conn.execute(
-                                "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND done_at>=?",
-                                (r["started_at"],),
-                            ).fetchone()[0]
-                        out.append({
-                            "id": r["id"], "started_at": r["started_at"], "ended_at": r["ended_at"],
-                            "focused_min": r["focused_min"], "periods": r["periods"], "tasks_done": done,
-                        })
-                    self._json(200, out)
+                    self._json(200, [
+                        {"id": r["id"], "label": r["label"], "position": r["position"], "blocks": r["blocks"],
+                         "focused_min": r["focused_min"]}
+                        for r in rows
+                    ])
                 elif path == "/api/categories":
                     cats = []
                     for c in conn.execute(
