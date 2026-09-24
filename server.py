@@ -213,6 +213,7 @@ def default_pomo_state(cfg: dict) -> dict:
         "task_id": None,
         "task_label": "",
         "phase_started_at": None,
+        "logged_ms": 0,
     }
 
 
@@ -249,6 +250,7 @@ def new_phase(conn, st: dict, phase: str, running: bool) -> dict:
     st["running"] = running
     st["started_at"] = now_iso() if running else None
     st["phase_started_at"] = now_iso()
+    st["logged_ms"] = 0
     return st
 
 
@@ -282,6 +284,22 @@ def log_period(conn, st: dict, minutes: int, started_at: str, ended_at: str):
     )
 
 
+def log_partial(conn, st: dict):
+    """Record unlogged focus time (called on pause/reset/session end)."""
+    if st["phase"] != "focus" or not st.get("phase_started_at"):
+        return
+    elapsed = pomo_elapsed_ms(st)
+    logged = int(st.get("logged_ms") or 0)
+    unlogged = elapsed - logged
+    if unlogged < 60000:
+        return
+    base = parse_iso(st["phase_started_at"])
+    started = (base + timedelta(milliseconds=logged)).isoformat(timespec="seconds")
+    ended = (base + timedelta(milliseconds=elapsed)).isoformat(timespec="seconds")
+    log_period(conn, st, max(1, round(unlogged / 60000)), started, ended)
+    st["logged_ms"] = elapsed
+
+
 def pomo_tick(conn) -> dict:
     """Finalize a due phase; advances to the next one (auto-starts if configured)."""
     st = get_pomo_state(conn)
@@ -292,9 +310,12 @@ def pomo_tick(conn) -> dict:
     if elapsed < duration:
         return st
     if st["phase"] == "focus":
-        started = st.get("phase_started_at") or st["started_at"]
-        ended = (parse_iso(started) + timedelta(minutes=int(st["duration_min"]))).isoformat(timespec="seconds")
-        log_period(conn, st, max(1, round(elapsed / 60000)), started, ended)
+        base = parse_iso(st.get("phase_started_at") or st["started_at"])
+        logged = int(st.get("logged_ms") or 0)
+        rem_ms = max(60000, duration - logged)
+        p_started = (base + timedelta(milliseconds=logged)).isoformat(timespec="seconds")
+        p_ended = (base + timedelta(milliseconds=duration)).isoformat(timespec="seconds")
+        log_period(conn, st, max(1, round(rem_ms / 60000)), p_started, p_ended)
     auto = pomo_config(conn)["auto_next"]
     st = new_phase(conn, st, "break" if st["phase"] == "focus" else "focus", running=auto)
     save_pomo_state(conn, st)
@@ -342,6 +363,11 @@ def pomo_payload(conn) -> dict:
         "SELECT COALESCE(SUM(minutes),0), COUNT(*) FROM pomo_periods WHERE substr(started_at,1,10)=?",
         (today_str(),),
     ).fetchone()
+    today_min = today[0]
+    if st["phase"] == "focus" and st.get("phase_started_at") and st["phase_started_at"][:10] == today_str():
+        unlogged = pomo_elapsed_ms(st) - int(st.get("logged_ms") or 0)
+        if unlogged > 0:
+            today_min += round(unlogged / 60000)
 
     return {
         "phase": st["phase"],
@@ -356,7 +382,7 @@ def pomo_payload(conn) -> dict:
         "category": category,
         "task": {"id": st.get("task_id"), "label": task_label} if task_label or st.get("task_id") else None,
         "session": session,
-        "today": {"focused_min": today[0], "periods": today[1]},
+        "today": {"focused_min": today_min, "periods": today[1]},
     }
 
 
@@ -379,12 +405,15 @@ def pomo_action(conn, action: str, body: dict):
             st["elapsed_ms"] = pomo_elapsed_ms(st)
             st["running"] = False
             st["started_at"] = None
+            log_partial(conn, st)
         save_pomo_state(conn, st)
     elif action == "reset":
+        log_partial(conn, st)
         st["elapsed_ms"] = 0
         st["running"] = False
         st["started_at"] = None
         st["phase_started_at"] = None
+        st["logged_ms"] = 0
         save_pomo_state(conn, st)
     elif action == "skip":
         st = new_phase(conn, st, "break" if st["phase"] == "focus" else "focus", running=False)
@@ -416,6 +445,7 @@ def pomo_action(conn, action: str, body: dict):
         if cid:
             if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cid,)).fetchone():
                 raise ValueError("category not found")
+        log_partial(conn, st)
         if st.get("session_id"):
             conn.execute("UPDATE pomo_sessions SET ended_at=COALESCE(ended_at,?) WHERE id=?",
                          (now_iso(), st["session_id"]))
@@ -426,6 +456,7 @@ def pomo_action(conn, action: str, body: dict):
         st = new_phase(conn, st, "focus", running=False)
         save_pomo_state(conn, st)
     elif action == "end_session":
+        log_partial(conn, st)
         if st.get("session_id"):
             conn.execute("UPDATE pomo_sessions SET ended_at=COALESCE(ended_at,?) WHERE id=?",
                          (now_iso(), st["session_id"]))
