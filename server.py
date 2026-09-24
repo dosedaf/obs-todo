@@ -950,6 +950,8 @@ MANAGE = """<!doctype html>
   .tool.danger { color: #57575a; }
   .tool.danger:hover { color: #ffffff; border-color: #ffffff; }
   .task { border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .task[draggable="true"] { cursor: grab; }
+  .task[draggable="true"]:active { cursor: grabbing; }
   .task:last-child { border-bottom: none; }
   .row { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
   .statebtn {
@@ -1002,18 +1004,11 @@ MANAGE = """<!doctype html>
     font-size: 10.5px; font-weight: 700; text-transform: uppercase;
     letter-spacing: 3px; color: #9b9b9e;
   }
-  .sessrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; max-width: 560px; margin-bottom: 10px; }
+  .dayhead { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
   .sessname { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 2.5px; color: #9b9b9e; }
-  .tctrl select.tinput { width: auto; min-width: 130px; margin-bottom: 0; appearance: auto; }
   .tctrl { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
   .tsum { margin-top: 14px; font-size: 12.5px; color: #57575a; }
   .tsum b { color: #9b9b9e; font-weight: 600; }
-  .srow { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 7px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12.5px; color: #9b9b9e; cursor: pointer; border-radius: 7px; }
-  .srow:hover { background: rgba(255,255,255,0.05); color: #eaeaec; }
-  .srow.cur { color: #ffffff; font-weight: 600; }
-  .srow.cur::after { content: " current"; font-size: 10px; color: #57575a; font-weight: 400; }
-  .srow:last-child { border-bottom: none; }
-  .srow .num { font-variant-numeric: tabular-nums; color: #cfcfd2; }
   .ttime {
     font-size: 46px; font-weight: 700; font-variant-numeric: tabular-nums;
     letter-spacing: 1px; line-height: 1.1; color: #9b9b9e;
@@ -1077,7 +1072,11 @@ MANAGE = """<!doctype html>
 </nav>
 
 <div id="view-tasks">
-  <div class="tabs" id="tabs"></div>
+  <div class="dayhead">
+    <span class="sessname" id="sessname">&ndash;</span>
+    <button class="tool" onclick="toggleDayTabs()">sessions</button>
+  </div>
+  <div class="tabs hidden" id="tabs"></div>
   <div class="card"><div id="list"></div>
     <div class="addbar">
       <input type="text" id="newtext" placeholder="new task... (Enter)" onkeydown="if(event.key==='Enter')addTask()">
@@ -1095,28 +1094,14 @@ MANAGE = """<!doctype html>
 
 <div id="view-timer" class="hidden">
   <div class="tbox" id="tbox">
-    <div class="sessrow">
-      <span class="sessname" id="sessname">&ndash;</span>
-      <button class="tool" onclick="toggleSessions()">sessions</button>
-    </div>
     <div class="tphase" id="tphase">focus</div>
     <div class="ttime" id="ttime">&ndash;</div>
     <div class="tctrl">
-      <select class="tinput" id="cat" onchange="pomoSetCat(this.value ? +this.value : null)"></select>
       <button class="tool pri" id="btn-toggle" onclick="pomoToggle()">start</button>
       <button class="tool" onclick="pomoAct('reset')">reset</button>
       <button class="tool" onclick="pomoAct('skip')">skip</button>
     </div>
     <div class="tsum" id="tsum">&nbsp;</div>
-  </div>
-  <div class="card hidden" id="sesspanel" style="margin-top:12px">
-    <div class="prow">
-      <select class="tinput" id="sesssort" onchange="renderSessions()" style="width:auto; margin-bottom:0">
-        <option value="latest">latest added</option>
-        <option value="oldest">oldest first</option>
-      </select>
-    </div>
-    <div id="sesslist" style="max-height:300px; overflow-y:auto"></div>
   </div>
   <details class="setdrop">
     <summary>settings</summary>
@@ -1133,6 +1118,13 @@ MANAGE = """<!doctype html>
         <div class="prow">
           <button class="tool" onclick="saveCfg()">save</button>
         </div>
+      </div>
+      <div class="setcol">
+        <div class="ctitle">context</div>
+        <div class="lbl">category</div>
+        <select class="tinput" id="cat" onchange="pomoSetCat(this.value ? +this.value : null)"></select>
+        <div class="lbl" style="margin-top:10px">session</div>
+        <select class="tinput" id="sesspick" onchange="switchSession(this.value ? +this.value : null)"></select>
       </div>
     </div>
   </details>
@@ -1202,7 +1194,7 @@ MANAGE = """<!doctype html>
     document.querySelectorAll(".nlinks button").forEach(b => b.classList.toggle("cur", b.dataset.v === v));
     ["tasks","timer","summary","log"].forEach(x => $("view-" + x).classList.toggle("hidden", x !== v));
     if (v === "tasks") load(true);
-    if (v === "timer") { if (!tickTimer) tickTimer = setInterval(renderTime, 250); loadSessions(); }
+    if (v === "timer") { if (!tickTimer) tickTimer = setInterval(renderTime, 250); }
     else if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
     if (v === "summary") loadSummary();
     if (v === "log") loadLog();
@@ -1219,6 +1211,7 @@ MANAGE = """<!doctype html>
     refreshUndo();
     const sn = $("sessname");
     if (sn) sn.textContent = days.find(d => d.id === currentDayId)?.label || "";
+    fillSessPick();
   }
 
   function renderTasks() {
@@ -1232,7 +1225,7 @@ MANAGE = """<!doctype html>
       return;
     }
     list.innerHTML = day.tasks.map(t => `
-      <div class="task ${t.state}">
+      <div class="task ${t.state}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)">
         <div class="row">
           <button class="statebtn" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</button>
           <span class="ttext" onclick="toggleEditor(${t.id})">${esc(t.text)}${t.details ? '<span class="hasnotes">&#9998;</span>' : ""}</span>
@@ -1288,6 +1281,7 @@ MANAGE = """<!doctype html>
   async function selectDay(id) {
     selectedId = id;
     if (id !== currentDayId) await api("/api/current-day", "POST", {day_id: id});
+    $("tabs").classList.add("hidden");
     await load();
   }
 
@@ -1506,36 +1500,43 @@ MANAGE = """<!doctype html>
     }).join("");
   }
 
-  // ---------- sessions panel (day tabs as sessions)
-  let sessions = [];
-  async function loadSessions() {
-    try {
-      sessions = await api("/api/sessions");
-      renderSessions();
-    } catch (e) {}
+  // ---------- session switching (day tabs as sessions)
+  function toggleDayTabs() {
+    $("tabs").classList.toggle("hidden");
   }
-  function toggleSessions() {
-    const p = $("sesspanel");
-    p.classList.toggle("hidden");
-    if (!p.classList.contains("hidden")) loadSessions();
+  function fillSessPick() {
+    const sel = $("sesspick");
+    if (!sel) return;
+    const rows = [...days].sort((a, b) => b.position - a.position);
+    sel.innerHTML = rows.map(d =>
+      `<option value="${d.id}" ${d.id === currentDayId ? "selected" : ""}>${esc(d.label)}</option>`).join("");
   }
   async function switchSession(id) {
     await api("/api/current-day", "POST", {day_id: id});
     selectedId = null;
+    $("tabs").classList.add("hidden");
     await load();
-    loadSessions();
   }
-  function renderSessions() {
-    const el = $("sesslist");
-    if (!el) return;
-    const sort = $("sesssort") ? $("sesssort").value : "latest";
-    const rows = [...sessions];
-    rows.sort((a, b) => sort === "oldest" ? a.position - b.position : b.position - a.position);
-    const cur = currentDayId;
-    el.innerHTML = rows.map(s => `<div class="srow ${s.id === cur ? "cur" : ""}" onclick="switchSession(${s.id})">
-        <span>${esc(s.label)}</span>
-        <span class="num">${fmtHM(s.focused_min)} &middot; ${s.blocks} block${s.blocks === 1 ? "" : "s"}</span>
-      </div>`).join("") || `<div class="empty" style="padding:8px 0">no sessions</div>`;
+
+  // ---------- drag to reorder tasks
+  let dragId = null;
+  function onDragStart(id, ev) {
+    dragId = id;
+    if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+  }
+  function onDragOver(ev) { ev.preventDefault(); }
+  async function onDrop(targetId, ev) {
+    ev.preventDefault();
+    if (dragId === null || dragId === targetId) return;
+    const day = days.find(d => d.id === selectedId);
+    if (!day) return;
+    const vis = day.tasks.filter(t => t.state !== "done").map(t => t.id);
+    const from = vis.indexOf(dragId), to = vis.indexOf(targetId);
+    dragId = null;
+    if (from < 0 || to < 0) return;
+    vis.splice(to, 0, vis.splice(from, 1)[0]);
+    await api("/api/tasks/reorder", "POST", {day_id: day.id, order: vis});
+    await load(true);
   }
 
   // ---------- log view
@@ -1574,16 +1575,17 @@ MANAGE = """<!doctype html>
 
   document.addEventListener("keydown", e => {
     const t = e.target;
-    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(t.tagName))) return;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
     if (e.code === "Space" && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       if (pomo) pomoToggle();
       return;
     }
-    if (e.altKey && !e.ctrlKey && !e.metaKey) {
-      const map = {Digit1: "tasks", Digit2: "timer", Digit3: "summary", Digit4: "log",
-                   Numpad1: "tasks", Numpad2: "timer", Numpad3: "summary", Numpad4: "log"};
-      if (map[e.code]) { e.preventDefault(); switchView(map[e.code]); }
+    const map = {Digit1: "tasks", Digit2: "timer", Digit3: "summary", Digit4: "log",
+                 Numpad1: "tasks", Numpad2: "timer", Numpad3: "summary", Numpad4: "log"};
+    if ((e.ctrlKey || e.altKey) && !e.metaKey && map[e.code]) {
+      e.preventDefault();
+      switchView(map[e.code]);
     }
   });
 
@@ -1738,6 +1740,35 @@ def make_handler(db_path: str):
                     )
                     conn.commit()
                     self._json(201, {"id": cur.lastrowid})
+                elif self.path == "/api/tasks/reorder":
+                    day_id = body.get("day_id")
+                    order = [int(i) for i in (body.get("order") or [])]
+                    day = conn.execute("SELECT id FROM days WHERE id=?", (day_id,)).fetchone()
+                    if not day:
+                        return self._json(404, {"error": "day not found"})
+                    if order:
+                        marks = ",".join("?" for _ in order)
+                        owned = conn.execute(
+                            f"SELECT COUNT(*) FROM tasks WHERE day_id=? AND id IN ({marks})",
+                            [day_id] + order,
+                        ).fetchone()[0]
+                        if owned != len(set(order)):
+                            return self._json(400, {"error": "order must contain only this day's tasks"})
+                        base = conn.execute(
+                            "SELECT COALESCE(MAX(position),0) FROM tasks WHERE day_id=?", (day_id,)
+                        ).fetchone()[0]
+                        for n, tid in enumerate(order):
+                            conn.execute("UPDATE tasks SET position=? WHERE id=?", (base + 1 + n, tid))
+                        done = conn.execute(
+                            f"SELECT id FROM tasks WHERE day_id=? AND state='done' AND id NOT IN ({marks}) "
+                            "ORDER BY position",
+                            [day_id] + order,
+                        ).fetchall()
+                        for n, r in enumerate(done):
+                            conn.execute("UPDATE tasks SET position=? WHERE id=?",
+                                         (base + 1 + len(order) + n, r["id"]))
+                        conn.commit()
+                    self._json(200, {"ordered": len(order)})
                 elif self.path == "/api/pomodoro":
                     action = body.get("action")
                     self._json(200, pomo_action(conn, action, body))
