@@ -104,10 +104,6 @@ def init_db(db_path: str, seed_file: str | None):
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(pomo_periods)")]
     if "day_id" not in cols:
         conn.execute("ALTER TABLE pomo_periods ADD COLUMN day_id INTEGER REFERENCES days(id) ON DELETE SET NULL")
-    conn.execute(
-        "UPDATE pomo_periods SET day_id=? WHERE source='timer' AND day_id IS NULL",
-        (current_day_id(conn),),
-    )
     if conn.execute("SELECT COUNT(*) FROM days").fetchone()[0] == 0:
         cur = conn.execute("INSERT INTO days (label, position) VALUES ('Day 1', 1)")
         day_id = cur.lastrowid
@@ -118,6 +114,10 @@ def init_db(db_path: str, seed_file: str | None):
                 [(day_id, i["text"], i["state"], n + 1) for n, i in enumerate(items)],
             )
         conn.execute("INSERT INTO settings (key, value) VALUES ('current_day_id', ?)", (str(day_id),))
+    conn.execute(
+        "UPDATE pomo_periods SET day_id=? WHERE source='timer' AND day_id IS NULL",
+        (current_day_id(conn),),
+    )
     conn.commit()
     conn.close()
 
@@ -285,7 +285,7 @@ def log_period(conn, st: dict, minutes: int, started_at: str, ended_at: str):
 
 
 def log_partial(conn, st: dict):
-    """Record unlogged focus time (called on pause/reset/session end)."""
+    """Record unlogged focus time (called on pause/reset/skip/session end)."""
     if st["phase"] != "focus" or not st.get("phase_started_at"):
         return
     elapsed = pomo_elapsed_ms(st)
@@ -293,10 +293,8 @@ def log_partial(conn, st: dict):
     unlogged = elapsed - logged
     if unlogged < 60000:
         return
-    base = parse_iso(st["phase_started_at"])
-    started = (base + timedelta(milliseconds=logged)).isoformat(timespec="seconds")
-    ended = (base + timedelta(milliseconds=elapsed)).isoformat(timespec="seconds")
-    log_period(conn, st, max(1, round(unlogged / 60000)), started, ended)
+    started = st.get("started_at") or st["phase_started_at"]
+    log_period(conn, st, max(1, round(unlogged / 60000)), started, now_iso())
     st["logged_ms"] = elapsed
 
 
@@ -322,11 +320,10 @@ def pomo_tick(conn) -> dict:
     if elapsed < duration:
         return st
     if st["phase"] == "focus":
-        base = parse_iso(st.get("phase_started_at") or st["started_at"])
         logged = int(st.get("logged_ms") or 0)
         rem_ms = max(60000, duration - logged)
-        p_started = (base + timedelta(milliseconds=logged)).isoformat(timespec="seconds")
-        p_ended = (base + timedelta(milliseconds=duration)).isoformat(timespec="seconds")
+        p_started = st["started_at"]
+        p_ended = (parse_iso(st["started_at"]) + timedelta(milliseconds=rem_ms)).isoformat(timespec="seconds")
         log_period(conn, st, max(1, round(rem_ms / 60000)), p_started, p_ended)
     notify_phase(st["phase"])
     auto = pomo_config(conn)["auto_next"]
@@ -379,6 +376,7 @@ def pomo_action(conn, action: str, body: dict):
     if action == "start":
         elapsed = pomo_elapsed_ms(st)
         if elapsed >= int(st["duration_min"]) * 60000 or not st.get("phase_started_at"):
+            log_partial(conn, st)
             fresh = dict(st)
             fresh["elapsed_ms"] = 0
             fresh["running"] = False
@@ -395,10 +393,10 @@ def pomo_action(conn, action: str, body: dict):
         save_pomo_state(conn, st)
     elif action == "pause":
         if st["running"]:
+            log_partial(conn, st)
             st["elapsed_ms"] = pomo_elapsed_ms(st)
             st["running"] = False
             st["started_at"] = None
-            log_partial(conn, st)
         save_pomo_state(conn, st)
     elif action == "reset":
         log_partial(conn, st)
@@ -409,6 +407,7 @@ def pomo_action(conn, action: str, body: dict):
         st["logged_ms"] = 0
         save_pomo_state(conn, st)
     elif action == "skip":
+        log_partial(conn, st)
         st = new_phase(conn, st, "break" if st["phase"] == "focus" else "focus", running=False)
         save_pomo_state(conn, st)
     elif action == "set":
@@ -616,26 +615,36 @@ def _card_font(size: int, bold: bool):
             return ImageFont.load_default()
 
 
-def card_png(conn) -> bytes:
-    """1080x1080 minimalist day card: total focused, tasks done, top category."""
-    import io
-    from PIL import Image, ImageDraw
-
-    today = today_str()
+def _card_stats(conn, started_cond: str, done_cond: str, arg):
+    """Focused minutes, tasks done, and top category for a period filter."""
     focused = conn.execute(
-        "SELECT COALESCE(SUM(minutes),0) FROM pomo_periods WHERE substr(started_at,1,10)=?",
-        (today,),
+        "SELECT COALESCE(SUM(minutes),0) FROM pomo_periods WHERE " + started_cond,
+        (arg,),
     ).fetchone()[0]
     tasks_done = conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND substr(done_at,1,10)=?",
-        (today,),
+        "SELECT COUNT(*) FROM tasks WHERE done_at IS NOT NULL AND " + done_cond,
+        (arg,),
     ).fetchone()[0]
     top = conn.execute(
         "SELECT COALESCE(c.name,'Unallocated') AS name, SUM(p.minutes) AS m "
         "FROM pomo_periods p LEFT JOIN categories c ON c.id=p.category_id "
-        "WHERE substr(p.started_at,1,10)=? GROUP BY name ORDER BY m DESC LIMIT 1",
-        (today,),
+        "WHERE " + started_cond + " GROUP BY name ORDER BY m DESC LIMIT 1",
+        (arg,),
     ).fetchone()
+    return focused, tasks_done, top
+
+
+def _card_small(tasks_done: int, top) -> str:
+    small = f"{tasks_done} tasks"
+    if top and top["m"]:
+        small += f"  ·  {top['name']}"
+    return small
+
+
+def _card_render(big: str, small: str) -> bytes:
+    """1080x1080 minimalist card: big centered value, small context line."""
+    import io
+    from PIL import Image, ImageDraw
 
     W = H = 1080
     img = Image.new("RGB", (W, H), "#161618")
@@ -647,15 +656,40 @@ def card_png(conn) -> bytes:
         w = d.textlength(text, font=font)
         d.text(((W - w) / 2, y), text, font=font, fill=fill)
 
-    center(_hm(focused), f_big, H / 2 - 155, "#eaeaec")
-    small = f"{tasks_done} tasks"
-    if top and top["m"]:
-        small += f"  ·  {top['name']}"
+    center(big, f_big, H / 2 - 155, "#eaeaec")
     center(small, f_small, H / 2 + 105, "#9b9b9e")
 
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
+
+
+MONTHS = ("january", "february", "march", "april", "may", "june",
+          "july", "august", "september", "october", "november", "december")
+
+
+def card_png(conn) -> bytes:
+    """1080x1080 minimalist day card: total focused, tasks done, top category."""
+    focused, tasks_done, top = _card_stats(
+        conn, "substr(started_at,1,10)=?", "substr(done_at,1,10)=?", today_str())
+    return _card_render(_hm(focused), _card_small(tasks_done, top))
+
+
+def card_png_week(conn) -> bytes:
+    """1080x1080 minimalist week card: rolling last 7 days."""
+    since = (date.today() - timedelta(days=6)).isoformat()
+    focused, tasks_done, top = _card_stats(
+        conn, "substr(started_at,1,10)>=?", "substr(done_at,1,10)>=?", since)
+    return _card_render(_hm(focused), "last 7 days  ·  " + _card_small(tasks_done, top))
+
+
+def card_png_month(conn) -> bytes:
+    """1080x1080 minimalist month card: named calendar month, month-to-date."""
+    now = date.today()
+    focused, tasks_done, top = _card_stats(
+        conn, "substr(started_at,1,7)=?", "substr(done_at,1,7)=?",
+        f"{now.year:04d}-{now.month:02d}")
+    return _card_render(_hm(focused), MONTHS[now.month - 1] + "  ·  " + _card_small(tasks_done, top))
 
 
 # ---------------------------------------------------------------- pages
@@ -986,6 +1020,23 @@ MANAGE = """<!doctype html>
     border-radius: 9px; color: #eaeaec; padding: 9px 12px; font-size: 14px; font-family: inherit;
   }
   .empty { color: #57575a; padding: 16px 0; text-align: center; font-size: 13px; }
+  .donehead {
+    display: flex; align-items: center; gap: 7px;
+    padding: 10px 2px 6px; cursor: pointer; user-select: none;
+    color: #57575a; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 1.5px; font-weight: 700;
+  }
+  .donehead:hover { color: #9b9b9e; }
+  .donehead .arrow { font-size: 9px; }
+  .catrow { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
+  .catrow input[type=text] {
+    flex: 1; min-width: 0; margin-bottom: 0;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 9px; color: #eaeaec;
+    padding: 7px 10px; font-size: 12.5px; font-family: inherit;
+  }
+  .catrow .tool { flex: none; padding: 6px 9px; }
   .saved { color: #ffffff; font-size: 11.5px; margin-left: 8px; opacity: 0; transition: opacity .4s; }
   .saved.show { opacity: 1; }
   .hidden { display: none !important; }
@@ -1103,7 +1154,7 @@ MANAGE = """<!doctype html>
     </div>
     <div class="tsum" id="tsum">&nbsp;</div>
   </div>
-  <details class="setdrop">
+  <details class="setdrop" id="setdrop">
     <summary>settings</summary>
     <div class="setbody">
       <div class="setcol">
@@ -1117,12 +1168,19 @@ MANAGE = """<!doctype html>
         </div>
         <div class="prow">
           <button class="tool" onclick="saveCfg()">save</button>
+          <span class="saved" id="cfgmsg"></span>
         </div>
       </div>
       <div class="setcol">
         <div class="ctitle">context</div>
         <div class="lbl">category</div>
         <select class="tinput" id="cat" onchange="pomoSetCat(this.value ? +this.value : null)"></select>
+        <div class="catrow">
+          <input type="text" id="cat-new" placeholder="new category..." onkeydown="if(event.key==='Enter')addCat()">
+          <button class="tool pri" title="add category" onclick="addCat()">+</button>
+          <button class="tool" title="rename selected category" onclick="renameCat()">&#9998;</button>
+          <button class="tool danger" title="delete selected category" onclick="delCat()">&#128465;</button>
+        </div>
         <div class="lbl" style="margin-top:10px">session</div>
         <select class="tinput" id="sesspick" onchange="switchSession(this.value ? +this.value : null)"></select>
       </div>
@@ -1134,6 +1192,8 @@ MANAGE = """<!doctype html>
   <div class="statsgrid" id="statgrid"></div>
   <div class="prow">
     <button class="tool" onclick="dayCard()">today card &rarr; png</button>
+    <button class="tool" onclick="weekCard()">weekly card &rarr; png</button>
+    <button class="tool" onclick="monthCard()">monthly card &rarr; png</button>
   </div>
   <div class="card">
     <div class="ctitle">last 7 days by category</div>
@@ -1167,6 +1227,7 @@ MANAGE = """<!doctype html>
   const $ = id => document.getElementById(id);
   let view = "tasks";
   let days = [], currentDayId = null, selectedId = null, openId = null;
+  let doneCollapsed = localStorage.getItem("obstodo_done_collapsed") !== "0";
   let pomo = null, logData = null, sumData = null, tickTimer = null, deadline = 0;
   let wasEnded = null;
 
@@ -1224,7 +1285,19 @@ MANAGE = """<!doctype html>
       list.innerHTML = `<div class="empty">no tasks yet</div>`;
       return;
     }
-    list.innerHTML = day.tasks.map(t => `
+    const open = day.tasks.filter(t => t.state !== "done");
+    const done = day.tasks.filter(t => t.state === "done");
+    let html = open.map(taskHtml).join("");
+    if (done.length) {
+      html += `<div class="donehead" onclick="toggleDone()">` +
+        `<span class="arrow">${doneCollapsed ? "&#9656;" : "&#9662;"}</span> done (${done.length})</div>`;
+      if (!doneCollapsed) html += done.map(taskHtml).join("");
+    }
+    list.innerHTML = html;
+  }
+
+  function taskHtml(t) {
+    return `
       <div class="task ${t.state}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)">
         <div class="row">
           <button class="statebtn" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</button>
@@ -1239,7 +1312,13 @@ MANAGE = """<!doctype html>
           <button class="tool" onclick="saveTask(${t.id})">save</button>
           <span class="saved" id="ok-${t.id}">saved &#10003;</span>
         </div>
-      </div>`).join("");
+      </div>`;
+  }
+
+  function toggleDone() {
+    doneCollapsed = !doneCollapsed;
+    localStorage.setItem("obstodo_done_collapsed", doneCollapsed ? "1" : "0");
+    renderTasks();
   }
 
   function toggleEditor(id) {
@@ -1416,12 +1495,39 @@ MANAGE = """<!doctype html>
     wasEnded = pomo.ended;
     renderPomo();
   }
+  function cfgMsg(text, ok) {
+    const el = $("cfgmsg");
+    el.textContent = text;
+    el.style.color = ok ? "" : "#ff6b6b";
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), 2500);
+  }
+  function syncCfgInputs() {
+    if (!pomo) return;
+    $("cfg-focus").value = pomo.focus_min;
+    $("cfg-break").value = pomo.break_min;
+    $("cfg-auto").checked = pomo.auto_next;
+  }
+  $("setdrop").addEventListener("toggle", function () {
+    if (this.open) syncCfgInputs();
+  });
   async function saveCfg() {
-    pomo = await api("/api/pomodoro", "POST", {action: "config",
-      focus_min: parseInt($("cfg-focus").value, 10),
-      break_min: parseInt($("cfg-break").value, 10),
-      auto_next: $("cfg-auto").checked});
+    const focus = parseInt($("cfg-focus").value, 10);
+    const brk = parseInt($("cfg-break").value, 10);
+    if (!Number.isInteger(focus) || focus < 1 || focus > 600
+        || !Number.isInteger(brk) || brk < 1 || brk > 600) {
+      cfgMsg("focus and break must be 1..600", false);
+      return;
+    }
+    try {
+      pomo = await api("/api/pomodoro", "POST", {action: "config",
+        focus_min: focus, break_min: brk, auto_next: $("cfg-auto").checked});
+    } catch (e) {
+      cfgMsg(e.message || String(e), false);
+      return;
+    }
     renderPomo();
+    cfgMsg("saved \u2713", true);
   }
 
   function renderPomo() {
@@ -1434,9 +1540,6 @@ MANAGE = """<!doctype html>
     renderTime();
     $("btn-toggle").textContent = pomo.running ? "pause" : pomo.ended || pomo.remaining_ms <= 0 ? "start next" : "start";
     $("tsum").innerHTML = `today <b>${fmtHM(pomo.today.focused_min)}</b>`;
-    $("cfg-focus").value = pomo.focus_min;
-    $("cfg-break").value = pomo.break_min;
-    $("cfg-auto").checked = pomo.auto_next;
     loadCats();
   }
   let catSig = "";
@@ -1456,6 +1559,43 @@ MANAGE = """<!doctype html>
     catSig = "";
     loadCats();
   }
+  async function addCat() {
+    const el = $("cat-new");
+    const name = el.value.trim();
+    if (!name) return;
+    try {
+      const c = await api("/api/categories", "POST", {name});
+      el.value = "";
+      await pomoSetCat(c.id);
+    } catch (e) {
+      alert(e.message || String(e));
+    }
+  }
+  async function renameCat() {
+    const sel = $("cat");
+    const id = sel.value ? +sel.value : null;
+    if (!id) return;
+    const old = sel.options[sel.selectedIndex].text;
+    const name = (prompt("rename category", old) || "").trim();
+    if (!name || name === old) return;
+    try {
+      await api(`/api/categories/${id}`, "PATCH", {name});
+    } catch (e) {
+      alert(e.message || String(e));
+      return;
+    }
+    catSig = "";
+    loadCats();
+  }
+  async function delCat() {
+    const sel = $("cat");
+    const id = sel.value ? +sel.value : null;
+    if (!id) return;
+    const name = sel.options[sel.selectedIndex].text;
+    if (!confirm(`delete "${name}"? its focus periods become Unallocated.`)) return;
+    await api(`/api/categories/${id}`, "DELETE");
+    await pomoSetCat(null);
+  }
 
   // ---------- summary view
   async function loadSummary() {
@@ -1472,6 +1612,8 @@ MANAGE = """<!doctype html>
     drawBars($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
   }
   function dayCard() { window.open("/card.png", "_blank"); }
+  function weekCard() { window.open("/card-week.png", "_blank"); }
+  function monthCard() { window.open("/card-month.png", "_blank"); }
   function drawDaily(el, days) {
     const cats = [];
     days.forEach(d => d.cats.forEach(c => { if (!cats.includes(c.name)) cats.push(c.name); }));
@@ -1583,7 +1725,7 @@ MANAGE = """<!doctype html>
     }
     const map = {Digit1: "tasks", Digit2: "timer", Digit3: "summary", Digit4: "log",
                  Numpad1: "tasks", Numpad2: "timer", Numpad3: "summary", Numpad4: "log"};
-    if ((e.ctrlKey || e.altKey) && !e.metaKey && map[e.code]) {
+    if (e.ctrlKey && !e.metaKey && map[e.code]) {
       e.preventDefault();
       switchView(map[e.code]);
     }
@@ -1632,6 +1774,10 @@ def make_handler(db_path: str):
                     self._send(200, PAGE.encode())
                 elif path == "/card.png":
                     self._send(200, card_png(conn), "image/png")
+                elif path == "/card-week.png":
+                    self._send(200, card_png_week(conn), "image/png")
+                elif path == "/card-month.png":
+                    self._send(200, card_png_month(conn), "image/png")
                 elif path == "/manage":
                     self._send(200, MANAGE.encode())
                 elif path == "/api/todo":
@@ -1913,6 +2059,13 @@ def make_handler(db_path: str):
                     if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cat_id,)).fetchone():
                         return self._json(404, {"error": "category not found"})
                     conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
+                    st = get_pomo_state(conn)
+                    if st.get("category_id") == cat_id:
+                        st["category_id"] = None
+                        save_pomo_state(conn, st)
+                    if st.get("block_category_id") == cat_id:
+                        st["block_category_id"] = None
+                        save_pomo_state(conn, st)
                     conn.commit()
                     return self._send(204, b"")
                 self._json(404, {"error": "not found"})
