@@ -3,7 +3,7 @@
 
 Pages:
   /        -> stream overlay (read-only, follows the server's current day)
-  /manage  -> control panel (tasks, timer, log, summary)
+  /manage  -> control panel (tasks, timer, summary, log, tracker)
 
 Usage: python3 server.py [--file ../todolist.txt] [--db todo.db] [--port 8787]
 """
@@ -70,6 +70,39 @@ CREATE TABLE IF NOT EXISTS pomo_periods (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_periods_dedupe
     ON pomo_periods(category_id, task_label, minutes, started_at, ended_at);
+CREATE TABLE IF NOT EXISTS tracker_groups (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tracker_subjects (
+    id            INTEGER PRIMARY KEY,
+    group_id      INTEGER NOT NULL REFERENCES tracker_groups(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'book' CHECK (kind IN ('book','video','article','course','other')),
+    url           TEXT NOT NULL DEFAULT '',
+    unit_total    REAL,
+    unit_done     REAL NOT NULL DEFAULT 0,
+    unit_label    TEXT NOT NULL DEFAULT 'pages',
+    position_at   TEXT NOT NULL DEFAULT '',
+    state         TEXT NOT NULL DEFAULT 'todo' CHECK (state IN ('todo','doing','paused','done','dropped')),
+    started_at    TEXT,
+    finished_at   TEXT,
+    last_touched  TEXT,
+    snooze_until  TEXT,
+    snooze_reason TEXT NOT NULL DEFAULT '',
+    is_next       INTEGER NOT NULL DEFAULT 0,
+    notes         TEXT NOT NULL DEFAULT '',
+    position      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tracker_progress_log (
+    id              INTEGER PRIMARY KEY,
+    subject_id      INTEGER NOT NULL REFERENCES tracker_subjects(id) ON DELETE CASCADE,
+    logged_at       TEXT NOT NULL,
+    delta           REAL NOT NULL,
+    unit_done_after REAL NOT NULL,
+    note            TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -104,6 +137,8 @@ def init_db(db_path: str, seed_file: str | None):
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(pomo_periods)")]
     if "day_id" not in cols:
         conn.execute("ALTER TABLE pomo_periods ADD COLUMN day_id INTEGER REFERENCES days(id) ON DELETE SET NULL")
+    if "subject_id" not in cols:
+        conn.execute("ALTER TABLE pomo_periods ADD COLUMN subject_id INTEGER REFERENCES tracker_subjects(id) ON DELETE SET NULL")
     if conn.execute("SELECT COUNT(*) FROM days").fetchone()[0] == 0:
         cur = conn.execute("INSERT INTO days (label, position) VALUES ('Day 1', 1)")
         day_id = cur.lastrowid
@@ -146,44 +181,18 @@ def current_day_id(conn) -> int:
     return first["id"]
 
 
-def day_payload(conn, day_id: int):
-    day = conn.execute("SELECT id, label, position FROM days WHERE id=?", (day_id,)).fetchone()
-    if not day:
-        return None
+def todo_payload(conn) -> dict:
     tasks = conn.execute(
-        "SELECT id, text, state FROM tasks WHERE day_id=? "
-        "ORDER BY CASE state WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END, position",
-        (day_id,),
+        "SELECT id, text, state FROM tasks "
+        "ORDER BY CASE state WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END, position"
     ).fetchall()
     return {
-        "day": {"id": day["id"], "label": day["label"]},
-        "days": [
-            {"id": r["id"], "label": r["label"]}
-            for r in conn.execute("SELECT id, label FROM days ORDER BY position")
-        ],
         "items": [dict(t) for t in tasks],
         "stats": {
             "done": sum(t["state"] == "done" for t in tasks),
             "total": len(tasks),
         },
     }
-
-
-def manage_payload(conn) -> list:
-    out = []
-    for d in conn.execute("SELECT id, label, position FROM days ORDER BY position"):
-        tasks = conn.execute(
-            "SELECT id, text, details, state FROM tasks WHERE day_id=? "
-            "ORDER BY CASE state WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END, position",
-            (d["id"],),
-        ).fetchall()
-        out.append({"id": d["id"], "label": d["label"], "tasks": [dict(t) for t in tasks]})
-    return out
-
-
-def next_position(conn, day_id: int) -> int:
-    row = conn.execute("SELECT COALESCE(MAX(position),0)+1 AS p FROM tasks WHERE day_id=?", (day_id,)).fetchone()
-    return row["p"]
 
 
 def create_day(conn, label: str | None = None) -> sqlite3.Row:
@@ -226,6 +235,8 @@ def default_pomo_state(cfg: dict) -> dict:
         "duration_min": cfg["focus_min"],
         "category_id": None,
         "block_category_id": None,
+        "subject_id": None,
+        "block_subject_id": None,
         "block_day_id": None,
         "phase_started_at": None,
         "logged_ms": 0,
@@ -276,12 +287,17 @@ def log_period(conn, st: dict, minutes: int, started_at: str, ended_at: str):
     day = st.get("block_day_id")
     if day is None:
         day = current_day_id(conn)
+    sub = st.get("block_subject_id")
+    if sub is None:
+        sub = st.get("subject_id")
     conn.execute(
         "INSERT OR IGNORE INTO pomo_periods "
-        "(session_id, day_id, category_id, task_id, task_label, minutes, started_at, ended_at, source) "
-        "VALUES (?,?,?,?,?,?,?,?, 'timer')",
-        (None, day, cat, None, "", minutes, started_at, ended_at),
+        "(session_id, day_id, category_id, subject_id, task_id, task_label, minutes, started_at, ended_at, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?, 'timer')",
+        (None, day, cat, sub, None, "", minutes, started_at, ended_at),
     )
+    if sub:
+        touch_subject(conn, sub)
 
 
 def log_partial(conn, st: dict):
@@ -304,7 +320,7 @@ def notify_phase(phase: str):
         return
     try:
         msg = "focus done" if phase == "focus" else "break over"
-        subprocess.Popen(["notify-send", "-a", "obs-todo", "obs-todo", msg],
+        subprocess.Popen(["notify-send", "-a", "grind", "grind", msg],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
@@ -346,6 +362,16 @@ def pomo_payload(conn) -> dict:
         if row:
             category = {"id": row["id"], "name": row["name"]}
 
+    subject = None
+    if st.get("subject_id"):
+        row = conn.execute(
+            "SELECT s.id, s.name, s.state, g.name AS group_name FROM tracker_subjects s "
+            "LEFT JOIN tracker_groups g ON g.id=s.group_id WHERE s.id=?",
+            (st["subject_id"],),
+        ).fetchone()
+        if row:
+            subject = {"id": row["id"], "name": row["name"], "state": row["state"], "group": row["group_name"]}
+
     today = conn.execute(
         "SELECT COALESCE(SUM(minutes),0), COUNT(*) FROM pomo_periods WHERE substr(started_at,1,10)=?",
         (today_str(),),
@@ -367,6 +393,7 @@ def pomo_payload(conn) -> dict:
         "break_min": cfg["break_min"],
         "auto_next": cfg["auto_next"],
         "category": category,
+        "subject": subject,
         "today": {"focused_min": today_min, "periods": today[1]},
     }
 
@@ -382,6 +409,7 @@ def pomo_action(conn, action: str, body: dict):
             fresh["running"] = False
             st = new_phase(conn, fresh, st["phase"], running=True)
             st["block_category_id"] = st.get("category_id")
+            st["block_subject_id"] = st.get("subject_id")
             st["block_day_id"] = current_day_id(conn)
         else:
             st["running"] = True
@@ -389,6 +417,7 @@ def pomo_action(conn, action: str, body: dict):
             if not int(st.get("elapsed_ms") or 0):
                 # fresh paused phase: stamp picker category + active day onto it
                 st["block_category_id"] = st.get("category_id")
+                st["block_subject_id"] = st.get("subject_id")
                 st["block_day_id"] = current_day_id(conn)
         save_pomo_state(conn, st)
     elif action == "pause":
@@ -417,6 +446,14 @@ def pomo_action(conn, action: str, body: dict):
                 if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cid,)).fetchone():
                     raise ValueError("category not found")
             st["category_id"] = int(cid) if cid else None
+        if "subject_id" in body:
+            sid = body["subject_id"]
+            if sid:
+                if not conn.execute("SELECT 1 FROM tracker_subjects WHERE id=?", (sid,)).fetchone():
+                    raise ValueError("subject not found")
+                st["subject_id"] = int(sid)
+            else:
+                st["subject_id"] = None
         save_pomo_state(conn, st)
     elif action == "config":
         cfg = pomo_config(conn)
@@ -512,6 +549,127 @@ def import_pomofocus(conn, text: str, dry_run: bool) -> dict:
     return {"parsed": len(recs), "imported": imported, "skipped": skipped, "preview": []}
 
 
+# ---------------------------------------------------------------- tracker
+
+TRACKER_KINDS = {
+    "book":    {"label": "pages",   "total": None},
+    "video":   {"label": "min",     "total": None},
+    "article": {"label": "%",       "total": 100},
+    "course":  {"label": "lessons", "total": None},
+    "other":   {"label": "units",   "total": None},
+}
+TRACKER_STATES = ("todo", "doing", "paused", "done", "dropped")
+
+
+def tracker_stale_days(conn) -> int:
+    try:
+        return max(1, min(365, int(get_setting(conn, "tracker_stale_days", 14))))
+    except (TypeError, ValueError):
+        return 14
+
+
+def touch_subject(conn, subject_id):
+    if subject_id:
+        conn.execute("UPDATE tracker_subjects SET last_touched=? WHERE id=?", (now_iso(), subject_id))
+
+
+def tracker_subject_payload(s, focus_min: float, stale_days: int, today) -> dict:
+    """One subject row plus staleness fields."""
+    idle = (today - date.fromisoformat(s["last_touched"][:10])).days if s["last_touched"] else None
+    snoozed = bool(s["snooze_until"]) and s["snooze_until"] >= today.isoformat()
+    stale = s["state"] == "doing" and idle is not None and idle >= stale_days and not snoozed
+    return {
+        "id": s["id"], "group_id": s["group_id"], "name": s["name"],
+        "kind": s["kind"], "url": s["url"], "unit_label": s["unit_label"],
+        "unit_total": s["unit_total"], "unit_done": s["unit_done"] or 0,
+        "state": s["state"], "started_at": s["started_at"], "finished_at": s["finished_at"],
+        "last_touched": s["last_touched"], "snooze_until": s["snooze_until"],
+        "snooze_reason": s["snooze_reason"], "is_next": bool(s["is_next"]), "notes": s["notes"],
+        "days_idle": idle, "stale": stale, "snoozed": snoozed,
+        "focused_min": focus_min,
+    }
+
+
+def tracker_payload(conn) -> dict:
+    today = date.today()
+    stale_days = tracker_stale_days(conn)
+    focus = {r["subject_id"]: r["m"] for r in conn.execute(
+        "SELECT subject_id, SUM(minutes) AS m FROM pomo_periods "
+        "WHERE subject_id IS NOT NULL GROUP BY subject_id")}
+
+    groups = []
+    totals = {"active": 0, "stale": 0, "units_left": 0.0, "focused_min": 0}
+    for g in conn.execute("SELECT id, name, position FROM tracker_groups ORDER BY position"):
+        subs = [
+            tracker_subject_payload(s, focus.get(s["id"], 0), stale_days, today)
+            for s in conn.execute(
+                "SELECT * FROM tracker_subjects WHERE group_id=? ORDER BY position, id", (g["id"],)
+            )
+        ]
+        counted = [s for s in subs if s["state"] != "dropped"]
+        done_n = sum(s["state"] == "done" for s in counted)
+        for s in subs:
+            if s["state"] == "doing":
+                totals["active"] += 1
+            if s["stale"]:
+                totals["stale"] += 1
+            if s["state"] != "dropped" and s["unit_total"] is not None:
+                totals["units_left"] += max(0, s["unit_total"] - s["unit_done"])
+            totals["focused_min"] += s["focused_min"]
+        groups.append({
+            "id": g["id"], "name": g["name"], "position": g["position"],
+            "pct": round(100 * done_n / len(counted)) if counted else None,
+            "done": done_n, "count": len(counted),
+            "subjects": subs,
+        })
+    return {"stale_days": stale_days, "focus": get_setting(conn, "tracker_focus", ""), "groups": groups, "totals": totals}
+
+
+def tracker_progress(conn, subject_id: int, body: dict) -> dict:
+    s = conn.execute("SELECT * FROM tracker_subjects WHERE id=?", (subject_id,)).fetchone()
+    if not s:
+        raise ValueError("subject not found")
+    if "set" in body:
+        target = float(body["set"])
+        delta = target - (s["unit_done"] or 0)
+    else:
+        delta = float(body.get("delta") or 0)
+    if not delta:
+        return {"id": subject_id, "unit_done": s["unit_done"] or 0, "delta": 0}
+    new_done = max(0.0, (s["unit_done"] or 0) + delta)
+    if s["unit_total"] is not None:
+        new_done = min(new_done, float(s["unit_total"]))
+    applied = round(new_done - (s["unit_done"] or 0), 4)
+    now = now_iso()
+    conn.execute(
+        "UPDATE tracker_subjects SET unit_done=?, last_touched=?, "
+        "started_at=COALESCE(started_at, ?), "
+        "state=CASE WHEN state='todo' THEN 'doing' ELSE state END WHERE id=?",
+        (new_done, now, now, subject_id),
+    )
+    conn.execute(
+        "INSERT INTO tracker_progress_log (subject_id, logged_at, delta, unit_done_after, note) "
+        "VALUES (?,?,?,?,?)",
+        (subject_id, now, applied, new_done, (body.get("note") or "").strip()),
+    )
+    conn.commit()
+    return {"id": subject_id, "unit_done": new_done, "delta": applied}
+
+
+def tracker_set_next(conn, subject_id: int, group_id: int, on: bool):
+    if on:
+        conn.execute("UPDATE tracker_subjects SET is_next=0 WHERE group_id=?", (group_id,))
+    conn.execute("UPDATE tracker_subjects SET is_next=? WHERE id=?", (1 if on else 0, subject_id))
+
+
+def tracker_subject_history(conn, subject_id: int, limit: int = 30) -> list:
+    rows = conn.execute(
+        "SELECT logged_at, delta, unit_done_after, note FROM tracker_progress_log "
+        "WHERE subject_id=? ORDER BY id DESC LIMIT ?", (subject_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------- summary
 
 def pomo_summary(conn) -> dict:
@@ -552,17 +710,23 @@ def pomo_summary(conn) -> dict:
             y -= 1
         key = f"{y:04d}-{mo:02d}"
         months.append({"label": date(y, mo, 1).strftime("%b"), "min": sum(v for k, v in by_day.items() if k[:7] == key)})
+    months = [m for m in months if m["min"] > 0]
 
     daily = conn.execute(
-        "SELECT substr(p.started_at,1,10) AS d, COALESCE(c.name,'Unallocated') AS name, SUM(p.minutes) AS m "
-        "FROM pomo_periods p LEFT JOIN categories c ON c.id=p.category_id "
-        "WHERE substr(p.started_at,1,10)>=? GROUP BY d, name",
+        "SELECT substr(p.started_at,1,10) AS d, "
+        "CASE WHEN p.subject_id IS NOT NULL THEN COALESCE(g.name, 'learning') "
+        "ELSE COALESCE(c.name,'Unallocated') END AS bucket, SUM(p.minutes) AS m "
+        "FROM pomo_periods p "
+        "LEFT JOIN categories c ON c.id=p.category_id "
+        "LEFT JOIN tracker_subjects s ON s.id=p.subject_id "
+        "LEFT JOIN tracker_groups g ON g.id=s.group_id "
+        "WHERE substr(p.started_at,1,10)>=? GROUP BY d, bucket",
         ((date.today() - timedelta(days=6)).isoformat(),),
     ).fetchall()
     by_day = {}
     for r in daily:
         e = by_day.setdefault(r["d"], {"cats": {}, "total": 0})
-        e["cats"][r["name"]] = e["cats"].get(r["name"], 0) + r["m"]
+        e["cats"][r["bucket"]] = e["cats"].get(r["bucket"], 0) + r["m"]
         e["total"] += r["m"]
     daily_categories = []
     for i in range(6, -1, -1):
@@ -698,7 +862,7 @@ PAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>todo overlay</title>
+<title>grind overlay</title>
 <style>
   html, body {
     margin: 0;
@@ -719,24 +883,6 @@ PAGE = """<!doctype html>
     display: flex;
     flex-direction: column;
   }
-  .daynav {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-  }
-  .daynav button {
-    background: none;
-    border: 1px solid rgba(255,255,255,0.14);
-    color: #9b9b9e;
-    border-radius: 8px;
-    font-size: 16px;
-    width: 32px;
-    height: 28px;
-    cursor: pointer;
-  }
-  .daynav button:hover { color: #eaeaec; border-color: rgba(255,255,255,0.32); }
-  .daylabel { font-size: 14px; font-weight: 600; color: #9b9b9e; letter-spacing: 0.4px; }
 
   .stats {
     display: flex;
@@ -843,18 +989,6 @@ PAGE = """<!doctype html>
     } catch (e) {}
   }
 
-  function shift(dir) {
-    if (!data) return;
-    const idx = data.days.findIndex(x => x.id === data.day.id);
-    const target = data.days[idx + dir];
-    if (!target) return;
-    fetch("/api/current-day", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({day_id: target.id})
-    }).then(tick);
-  }
-
   function pomoHtml() {
     if (!pomo) return "";
     const cls = pomo.ended ? "ended" : pomo.running ? "running" : "paused";
@@ -892,13 +1026,7 @@ PAGE = """<!doctype html>
       deadline = Date.now() + pomo.remaining_ms;
       if (pomo.ended && prevEnded === false) bell();
       const pct = data.stats.total ? Math.round(100 * data.stats.done / data.stats.total) : 0;
-      const idx = data.days.findIndex(x => x.id === data.day.id);
       let html = `
-        <div class="daynav">
-          <button onclick="shift(-1)">&#9664;</button>
-          <span class="daylabel">${esc(data.day.label)} &middot; ${idx + 1}/${data.days.length}</span>
-          <button onclick="shift(1)">&#9654;</button>
-        </div>
         <div class="stats"><span>${data.stats.done} / ${data.stats.total} done</span><span>${pct}%</span></div>
         ${pomoHtml()}
         <div class="listwrap"><ul>` + data.items.filter(i => i.state !== "done").map(i =>
@@ -919,7 +1047,7 @@ MANAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>obs-todo</title>
+<title>grind</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -946,33 +1074,12 @@ MANAGE = """<!doctype html>
   .nlinks button.cur { color: #ffffff; border-bottom-color: #ffffff; font-weight: 600; }
 
   .hint { color: #9b9b9e; font-size: 12.5px; margin-bottom: 14px; }
-  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; align-items: center; }
-  .tab {
-    padding: 5px 10px; border: none; background: none;
-    color: #57575a; cursor: pointer; font-size: 13px; border-radius: 8px;
-    font-family: inherit;
-  }
-  .tab:hover { color: #9b9b9e; }
-  .tab.current {
-    background: #eaeaec; color: #161618; font-weight: 700;
-    padding: 7px 15px; font-size: 13.5px;
-  }
-  .tab .edit { opacity: 0.45; margin-left: 7px; font-size: 11px; cursor: text; }
-  .tab .edit:hover { opacity: 1; }
-  .tab.current .edit { opacity: 0.6; }
-  .tab input.rename {
-    background: transparent; border: none; outline: none;
-    border-bottom: 1px solid currentColor; color: inherit;
-    font: inherit; font-weight: 700; width: 90px; padding: 0;
-  }
   .card {
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 12px;
     padding: 10px 14px;
   }
-  .bottombar { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
-  .bottombar .spacer { flex: 1; }
   .tool, button.std {
     padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.12);
     background: none; color: #9b9b9e; cursor: pointer; font-size: 12.5px;
@@ -1019,6 +1126,22 @@ MANAGE = """<!doctype html>
     flex: 1; background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.14);
     border-radius: 9px; color: #eaeaec; padding: 9px 12px; font-size: 14px; font-family: inherit;
   }
+  .addreveal { margin-top: 10px; padding: 4px 12px; font-size: 14px; line-height: 1.3; color: #57575a; }
+  .addreveal:hover { color: #eaeaec; }
+  .tviewtabs { display: flex; gap: 2px; margin-bottom: 10px; }
+  .tviewtab {
+    background: none; border: none; color: #57575a; cursor: pointer; font-size: 12.5px;
+    padding: 4px 11px; border-radius: 8px; font-family: inherit;
+  }
+  .tviewtab:hover { color: #9b9b9e; }
+  .tviewtab.cur { background: rgba(255,255,255,0.06); color: #eaeaec; font-weight: 600; }
+  #notebox {
+    width: 100%; box-sizing: border-box; min-height: 55vh;
+    background: none; border: none; outline: none; resize: vertical;
+    color: #eaeaec; font-size: 14.5px; line-height: 1.65; font-family: inherit; padding: 2px;
+  }
+  #notebox::placeholder { color: #3f3f43; }
+  .noterow { display: flex; justify-content: flex-end; margin-top: 4px; }
   .empty { color: #57575a; padding: 16px 0; text-align: center; font-size: 13px; }
   .donehead {
     display: flex; align-items: center; gap: 7px;
@@ -1055,8 +1178,6 @@ MANAGE = """<!doctype html>
     font-size: 10.5px; font-weight: 700; text-transform: uppercase;
     letter-spacing: 3px; color: #9b9b9e;
   }
-  .dayhead { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-  .sessname { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 2.5px; color: #9b9b9e; }
   .tctrl { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; justify-content: center; }
   .tsum { margin-top: 14px; font-size: 12.5px; color: #57575a; }
   .tsum b { color: #9b9b9e; font-weight: 600; }
@@ -1077,7 +1198,8 @@ MANAGE = """<!doctype html>
   details.setdrop summary::-webkit-details-marker { display: none; }
   details.setdrop summary:hover { color: #9b9b9e; }
   details.setdrop[open] summary { color: #9b9b9e; border-color: rgba(255,255,255,0.20); }
-  .setbody { padding: 16px 4px 4px; display: grid; grid-template-columns: 1fr; gap: 16px; }
+  .setbody { padding: 16px 4px 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+  .setcol { min-width: 0; }
   .setcol .ctitle { margin-top: 0; }
   .ctitle { font-size: 11px; color: #57575a; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin: 4px 0 8px; }
   .prow { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
@@ -1102,20 +1224,107 @@ MANAGE = """<!doctype html>
   .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
   .legend span { font-size: 11px; color: #9b9b9e; display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-  .drow { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
-  .drow s { text-decoration: none; flex: 0 0 58px; font-size: 11px; color: #57575a; }
-  .drow .dbar { flex: 1; height: 10px; border-radius: 5px; background: rgba(255,255,255,0.06); display: flex; overflow: hidden; }
-  .drow .dbar i { display: block; height: 100%; }
-  .drow b { flex: 0 0 56px; text-align: right; font-size: 11px; color: #9b9b9e; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .twisty { background: none; border: none; color: #57575a; cursor: pointer; font-size: 10px; padding: 0 2px; font-family: inherit; line-height: 1; }
+  .twisty:hover { color: #eaeaec; }
+  .cardkebab { position: absolute; top: 10px; right: 12px; font-size: 16px; }
+  .cardmenu { top: 32px; right: 14px; min-width: 160px; }
+  .focusline { font-size: 14.5px; color: #eaeaec; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .focusline.dim { color: #57575a; }
+  .focusinput { flex: 1; min-width: 0; background: none; border: none; outline: none; border-bottom: 1px solid rgba(255,255,255,0.2); color: #eaeaec; font-size: 14.5px; font-family: inherit; padding: 2px 0; }
+  .histplot { position: relative; height: 220px; margin: 20px 0 20px 30px; }
+  .histgrid { position: absolute; left: 0; right: 0; top: 0; bottom: 20px; }
+  .gline { position: absolute; left: 0; right: 0; border-top: 1px solid rgba(255,255,255,0.05); }
+  .gline s { position: absolute; left: -30px; top: -6px; width: 24px; text-align: right; text-decoration: none; font-size: 9.5px; color: #57575a; font-variant-numeric: tabular-nums; }
+  .hist { position: absolute; left: 0; right: 0; top: 0; bottom: 20px; display: flex; align-items: flex-end; gap: 4px; }
+  .hcol { position: relative; flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; }
+  .hcol b { font-size: 10px; color: #9b9b9e; font-weight: 600; margin-bottom: 4px; height: 13px; line-height: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .hstack { width: 100%; display: flex; flex-direction: column-reverse; border-radius: 3px 3px 0 0; overflow: hidden; background: #eaeaec; }
+  .hstack i { display: block; width: 100%; min-height: 2px; }
+  .hcol s { position: absolute; bottom: -20px; left: 0; right: 0; text-align: center; text-decoration: none; font-size: 9.5px; color: #57575a; }
+  .mrow { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+  .mrow s { text-decoration: none; flex: 0 0 34px; font-size: 11px; color: #57575a; }
+  .mbar { flex: 1; height: 8px; border-radius: 4px; background: rgba(255,255,255,0.05); overflow: hidden; }
+  .mbar i { display: block; height: 100%; background: #c9c9ce; border-radius: 4px; }
+  .mrow b { flex: 0 0 56px; text-align: right; font-size: 11px; color: #9b9b9e; font-variant-numeric: tabular-nums; font-weight: 600; }
 
   .statsgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+
+  /* tracker */
+  .group { border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; margin-bottom: 8px; background: rgba(255,255,255,0.015); }
+  .ghead { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; user-select: none; border-radius: 10px 10px 0 0; }
+  .ghead[draggable="true"] { cursor: grab; }
+  .ghead[draggable="true"]:active { cursor: grabbing; }
+  .ghead:hover { background: rgba(255,255,255,0.03); }
+  .ghead .delbtn { opacity: 0; }
+  .ghead:hover .delbtn { opacity: 1; }
+  .garrow { font-size: 8px; color: #57575a; flex: none; }
+  .gname { font-weight: 700; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+  .gname:hover { color: #ffffff; }
+  .gbar { flex: 1; height: 5px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; min-width: 40px; }
+  .gbar i { display: block; height: 100%; background: #eaeaec; border-radius: 3px; }
+  .gpct { font-size: 11.5px; color: #eaeaec; font-variant-numeric: tabular-nums; width: 34px; text-align: right; font-weight: 700; flex: none; }
+  .gmeta { font-size: 10.5px; color: #57575a; white-space: nowrap; flex: none; }
+  .gbody { padding: 0 12px 8px; border-top: 1px solid rgba(255,255,255,0.04); border-radius: 0 0 10px 10px; }
+  .subj { border-bottom: 1px solid rgba(255,255,255,0.04); position: relative; }
+  .subj:last-of-type { border-bottom: none; }
+  .srow { display: flex; align-items: center; gap: 7px; padding: 5px 0; }
+  .srow[draggable="true"] { cursor: grab; }
+  .srow[draggable="true"]:active { cursor: grabbing; }
+  .star { background: none; border: none; cursor: pointer; color: #3f3f43; font-size: 13px; padding: 0; width: 16px; flex: none; line-height: 1; opacity: 0.35; }
+  .star.on { color: #e8d44d; opacity: 1; }
+  .srow:hover .star { opacity: 1; }
+  .star:hover { color: #e8d44d; }
+  .kebab { background: none; border: none; cursor: pointer; color: #9b9b9e; font-size: 14px; padding: 0 2px; flex: none; line-height: 1; opacity: 0.35; }
+  .srow:hover .kebab { opacity: 1; }
+  .kebab:hover { color: #ffffff; }
+  .sname { font-size: 14.5px; cursor: pointer; flex: 1 1 140px; min-width: 120px; font-weight: 400; }
+  .todo .sname { color: #9b9b9e; }
+  .doing .sname { color: #ffffff; }
+  .paused .sname { color: #57575a; }
+  .done .sname { color: #57575a; text-decoration: line-through; }
+  .dropped .sname { color: #3f3f43; text-decoration: line-through; }
+  .slink { color: #57575a; text-decoration: none; font-size: 11px; margin-left: 5px; }
+  .slink:hover { color: #eaeaec; }
+  .subj .statebtn { width: 22px; height: 22px; font-size: 12px; border-radius: 7px; }
+  .badge { font-size: 9.5px; padding: 1px 7px; border-radius: 8px; font-weight: 700; cursor: pointer; white-space: nowrap; flex: none; font-family: inherit; border: 1px solid transparent; }
+  .badge.stale { background: rgba(255,107,107,0.14); color: #ff6b6b; border-color: rgba(255,107,107,0.35); }
+  .badge.zzz { background: rgba(255,255,255,0.04); color: #9b9b9e; border-color: rgba(255,255,255,0.14); }
+  .badge.hold { background: rgba(232,212,77,0.10); color: #b3a23a; border-color: rgba(232,212,77,0.3); }
+  .qadd { background: none; border: 1px solid rgba(255,255,255,0.12); color: #9b9b9e; border-radius: 7px; font-size: 11px; padding: 2px 8px; cursor: pointer; font-family: inherit; flex: none; }
+  .qadd:hover { color: #eaeaec; border-color: rgba(255,255,255,0.30); }
+  .snoozebar { display: flex; gap: 6px; padding: 0 0 7px 25px; align-items: center; font-size: 11px; color: #57575a; flex-wrap: wrap; }
+  .menu { position: absolute; right: 8px; top: 24px; z-index: 60; min-width: 132px; background: #222226; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,0.5); padding: 4px; }
+  .menuhead { font-size: 10.5px; color: #57575a; padding: 5px 10px 6px; border-bottom: 1px solid rgba(255,255,255,0.07); margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+  .menuitem { display: block; width: 100%; text-align: left; padding: 6px 10px; font-size: 12.5px; color: #cfcfd2; background: none; border: none; border-radius: 6px; cursor: pointer; font-family: inherit; }
+  .menuitem:hover { background: rgba(255,255,255,0.06); color: #ffffff; }
+  .menuitem.danger { color: #ff6b6b; }
+  .menuitem.danger:hover { background: rgba(255,107,107,0.12); color: #ff6b6b; }
+  .addsub { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
+  .addsub input[type=text] {
+    flex: 1; min-width: 0;
+    background: none; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; color: #9b9b9e; padding: 6px 10px; font-size: 12.5px;
+    font-family: inherit; margin-bottom: 0;
+  }
+  .addsub input[type=text]:focus { color: #eaeaec; border-color: rgba(255,255,255,0.22); outline: none; }
+  .addsub .tool { padding: 5px 11px; }
+  .tedit { display: grid; grid-template-columns: 1fr; gap: 6px 14px; }
+  .tedit .full { grid-column: 1 / -1; }
+  .tedit input[type=text], .tedit textarea {
+    width: 100%; box-sizing: border-box;
+    background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 8px; color: #eaeaec; padding: 8px 10px; font-size: 13px;
+    font-family: inherit; margin-bottom: 0;
+  }
+  .tedit textarea { min-height: 54px; resize: vertical; }
 </style>
 </head>
 <body>
 <nav class="nav">
-  <span class="brand">obs-todo</span>
+  <span class="brand">grind</span>
   <span class="nlinks">
     <button data-v="tasks" class="cur" onclick="switchView('tasks')">tasks</button>
+    <button data-v="tracker" onclick="switchView('tracker')">tracker</button>
     <button data-v="timer" onclick="switchView('timer')">timer</button>
     <button data-v="summary" onclick="switchView('summary')">summary</button>
     <button data-v="log" onclick="switchView('log')">log</button>
@@ -1123,23 +1332,21 @@ MANAGE = """<!doctype html>
 </nav>
 
 <div id="view-tasks">
-  <div class="dayhead">
-    <span class="sessname" id="sessname">&ndash;</span>
-    <button class="tool" onclick="toggleDayTabs()">sessions</button>
+  <div class="tviewtabs">
+    <button class="tviewtab cur" data-tt="tasks" onclick="switchTaskTab('tasks')">tasks</button>
+    <button class="tviewtab" data-tt="text" onclick="switchTaskTab('text')">text</button>
   </div>
-  <div class="tabs hidden" id="tabs"></div>
-  <div class="card"><div id="list"></div>
-    <div class="addbar">
-      <input type="text" id="newtext" placeholder="new task... (Enter)" onkeydown="if(event.key==='Enter')addTask()">
+  <div class="card">
+    <div id="list"></div>
+    <div id="notewrap" class="hidden">
+      <textarea id="notebox" placeholder="lock tf in bum ahh lil ugly ahh boi" oninput="noteChanged()"></textarea>
+      <div class="noterow"><span class="saved" id="notesaved">saved &#10003;</span></div>
+    </div>
+    <div class="addbar hidden" id="addbar">
+      <input type="text" id="newtext" placeholder="new task... (Enter)" onkeydown="taskKey(event)">
       <button class="tool pri" onclick="addTask()">add</button>
     </div>
-  </div>
-  <div class="bottombar">
-    <button class="tool pri" title="add day" onclick="addDay()">+</button>
-    <button class="tool" title="carry unfinished to next day" onclick="carry()">&rarr;</button>
-    <button class="tool hidden" id="undobtn" onclick="undoCarry()">undo carry</button>
-    <span class="spacer"></span>
-    <button class="tool danger" title="delete day" onclick="delDay()">&#128465;</button>
+    <button class="tool addreveal" id="addreveal" title="add task" onclick="revealAdd()">&#43;</button>
   </div>
 </div>
 
@@ -1159,13 +1366,11 @@ MANAGE = """<!doctype html>
     <div class="setbody">
       <div class="setcol">
         <div class="ctitle">timer</div>
-        <div class="prow">
-          <span class="lbl" style="margin:0 6px 0 0">focus</span><input class="tinput" id="cfg-focus" type="number" min="1" max="600" style="width:70px; margin-bottom:0">
-          <span class="lbl" style="margin:0 6px 0 10px">break</span><input class="tinput" id="cfg-break" type="number" min="1" max="600" style="width:70px; margin-bottom:0">
+        <div class="prow" style="margin-bottom:8px">
+          <span class="lbl" style="margin:0 6px 0 0">focus</span><input class="tinput" id="cfg-focus" type="number" min="1" max="600" style="width:60px; margin-bottom:0">
+          <span class="lbl" style="margin:0 6px 0 10px">break</span><input class="tinput" id="cfg-break" type="number" min="1" max="600" style="width:60px; margin-bottom:0">
         </div>
-        <div class="prow">
-          <label class="lbl" style="margin:0; text-transform:none; letter-spacing:0; font-size:12.5px; color:#9b9b9e"><input type="checkbox" id="cfg-auto"> auto-start next phase</label>
-        </div>
+        <label class="lbl" style="margin:0 0 8px; text-transform:none; letter-spacing:0; font-size:12.5px; color:#9b9b9e"><input type="checkbox" id="cfg-auto"> auto-start next phase</label>
         <div class="prow">
           <button class="tool" onclick="saveCfg()">save</button>
           <span class="saved" id="cfgmsg"></span>
@@ -1181,8 +1386,8 @@ MANAGE = """<!doctype html>
           <button class="tool" title="rename selected category" onclick="renameCat()">&#9998;</button>
           <button class="tool danger" title="delete selected category" onclick="delCat()">&#128465;</button>
         </div>
-        <div class="lbl" style="margin-top:10px">session</div>
-        <select class="tinput" id="sesspick" onchange="switchSession(this.value ? +this.value : null)"></select>
+        <div class="lbl" style="margin-top:8px">subject</div>
+        <select class="tinput" id="subj" onchange="pomoSetSubj(this.value ? +this.value : null)"></select>
       </div>
     </div>
   </details>
@@ -1190,18 +1395,24 @@ MANAGE = """<!doctype html>
 
 <div id="view-summary" class="hidden">
   <div class="statsgrid" id="statgrid"></div>
-  <div class="prow">
-    <button class="tool" onclick="dayCard()">today card &rarr; png</button>
-    <button class="tool" onclick="weekCard()">weekly card &rarr; png</button>
-    <button class="tool" onclick="monthCard()">monthly card &rarr; png</button>
+  <div class="prow" style="margin:18px 0 8px; align-items:center; gap:6px">
+    <span class="ctitle" style="margin:0">tracker</span>
+    <button class="twisty" id="trktwist" onclick="toggleTrkStats()">&#9656;</button>
   </div>
-  <div class="card">
+  <div class="statsgrid" id="trkstatgrid" style="margin-bottom:16px"></div>
+  <div class="card" style="position:relative">
+    <button class="kebab cardkebab" title="export" onclick="toggleCardMenu(event)">&#8943;</button>
+    <div class="menu cardmenu" id="cardmenu" hidden>
+      <button class="menuitem" onclick="exportCard('day')">export today</button>
+      <button class="menuitem" onclick="exportCard('week')">export this week</button>
+      <button class="menuitem" onclick="exportCard('month')">export this month</button>
+    </div>
     <div class="ctitle">last 7 days by category</div>
     <div id="ch-daily"></div>
     <div class="ctitle" style="margin-top:22px">weekly</div>
     <div class="bars" id="ch-weeks"></div>
     <div class="ctitle" style="margin-top:22px">monthly</div>
-    <div class="bars" id="ch-months"></div>
+    <div id="ch-months"></div>
   </div>
 </div>
 
@@ -1221,12 +1432,21 @@ MANAGE = """<!doctype html>
   </div>
 </div>
 
+<div id="view-tracker" class="hidden">
+  <div class="prow" style="margin-bottom:12px; align-items:center">
+    <span id="trkfocus" class="focusline" ondblclick="editFocus()"></span>
+    <span style="flex:1"></span>
+    <button class="tool pri" title="add group" onclick="addGroup()">+</button>
+  </div>
+  <div id="trkgroups"></div>
+</div>
+
 <script>
   const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
   const GLYPH = {todo: "&#9675;", doing: "&#9679;", done: "&#10003;"};
   const $ = id => document.getElementById(id);
   let view = "tasks";
-  let days = [], currentDayId = null, selectedId = null, openId = null;
+  let tasks = [], openId = null;
   let doneCollapsed = localStorage.getItem("obstodo_done_collapsed") !== "0";
   let pomo = null, logData = null, sumData = null, tickTimer = null, deadline = 0;
   let wasEnded = null;
@@ -1253,40 +1473,31 @@ MANAGE = """<!doctype html>
   function switchView(v) {
     view = v;
     document.querySelectorAll(".nlinks button").forEach(b => b.classList.toggle("cur", b.dataset.v === v));
-    ["tasks","timer","summary","log"].forEach(x => $("view-" + x).classList.toggle("hidden", x !== v));
+    ["tasks","tracker","timer","summary","log"].forEach(x => $("view-" + x).classList.toggle("hidden", x !== v));
     if (v === "tasks") load(true);
     if (v === "timer") { if (!tickTimer) tickTimer = setInterval(renderTime, 250); }
     else if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
     if (v === "summary") loadSummary();
     if (v === "log") loadLog();
+    if (v === "tracker") loadTracker();
   }
 
   // ---------- tasks view
   async function load(keepOpen=false) {
-    days = await api("/api/days");
     const cur = await (await fetch("/api/todo")).json();
-    currentDayId = cur.day.id;
-    if (!selectedId || !days.find(d => d.id === selectedId)) selectedId = currentDayId;
+    tasks = cur.items;
     if (!keepOpen) openId = null;
     renderTasks();
-    refreshUndo();
-    const sn = $("sessname");
-    if (sn) sn.textContent = days.find(d => d.id === currentDayId)?.label || "";
-    fillSessPick();
   }
 
   function renderTasks() {
-    $("tabs").innerHTML = days.map(d =>
-      `<button class="tab ${d.id === currentDayId ? "current" : ""}" onclick="selectDay(${d.id})" title="click: select + push to stream">${esc(d.label)}${d.id === currentDayId ? `<span class="edit" title="rename day" onclick="renameDay(${d.id}, event)">&#9998;</span>` : ""}</button>`
-    ).join("");
-    const day = days.find(d => d.id === selectedId);
     const list = $("list");
-    if (!day || !day.tasks.length) {
+    if (!tasks.length) {
       list.innerHTML = `<div class="empty">no tasks yet</div>`;
       return;
     }
-    const open = day.tasks.filter(t => t.state !== "done");
-    const done = day.tasks.filter(t => t.state === "done");
+    const open = tasks.filter(t => t.state !== "done");
+    const done = tasks.filter(t => t.state === "done");
     let html = open.map(taskHtml).join("");
     if (done.length) {
       html += `<div class="donehead" onclick="toggleDone()">` +
@@ -1327,43 +1538,6 @@ MANAGE = """<!doctype html>
     if (openId === id) $(`txt-${id}`).focus();
   }
 
-  function renameDay(id, ev) {
-    ev.stopPropagation();
-    const tab = ev.target.closest(".tab");
-    const day = days.find(d => d.id === id);
-    const input = document.createElement("input");
-    input.className = "rename";
-    input.value = day.label;
-    tab.textContent = "";
-    tab.appendChild(input);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = ok => {
-      if (done) return;
-      done = true;
-      const label = ok ? input.value.trim() : "";
-      const p = (label && label !== day.label)
-        ? api(`/api/days/${id}`, "PATCH", {label})
-        : Promise.resolve();
-      p.then(() => load(true), () => load(true));
-    };
-    input.onkeydown = e => {
-      e.stopPropagation();
-      if (e.key === "Enter") finish(true);
-      if (e.key === "Escape") finish(false);
-    };
-    input.onblur = () => finish(true);
-    input.onclick = e => e.stopPropagation();
-  }
-
-  async function selectDay(id) {
-    selectedId = id;
-    if (id !== currentDayId) await api("/api/current-day", "POST", {day_id: id});
-    $("tabs").classList.add("hidden");
-    await load();
-  }
-
   async function cycleState(id, state) {
     const next = {todo: "doing", doing: "done", done: "todo"}[state];
     await api(`/api/tasks/${id}`, "PATCH", {state: next});
@@ -1386,46 +1560,55 @@ MANAGE = """<!doctype html>
     await load(true);
   }
 
+  let taskTab = "tasks", noteTimer = null, noteLoaded = false;
+  function switchTaskTab(mode) {
+    taskTab = mode;
+    document.querySelectorAll(".tviewtab").forEach(b => b.classList.toggle("cur", b.dataset.tt === mode));
+    const isTasks = mode === "tasks";
+    $("list").classList.toggle("hidden", !isTasks);
+    $("notewrap").classList.toggle("hidden", isTasks);
+    $("addreveal").classList.toggle("hidden", !isTasks);
+    if (isTasks) { hideAdd(); renderTasks(); }
+    else { hideAdd(); loadNote(); }
+  }
+  function revealAdd() {
+    $("addreveal").classList.add("hidden");
+    $("addbar").classList.remove("hidden");
+    $("newtext").focus();
+  }
+  function hideAdd() {
+    $("addbar").classList.add("hidden");
+    $("newtext").value = "";
+    if (taskTab === "tasks") $("addreveal").classList.remove("hidden");
+  }
+  function taskKey(ev) {
+    if (ev.key === "Enter") addTask();
+    else if (ev.key === "Escape") hideAdd();
+  }
   async function addTask() {
     const el = $("newtext");
     const text = el.value.trim();
-    if (!text) return;
-    await api("/api/tasks", "POST", {day_id: selectedId, text});
-    el.value = "";
+    if (!text) { hideAdd(); return; }
+    await api("/api/tasks", "POST", {text});
     await load(true);
+    hideAdd();
   }
-
-  async function addDay() {
-    const d = await api("/api/days", "POST", {});
-    selectedId = d.id;
-    await api("/api/current-day", "POST", {day_id: d.id});
-    await load();
+  function loadNote() {
+    if (noteLoaded) return;
+    noteLoaded = true;
+    fetch("/api/note").then(r => r.json()).then(n => { $("notebox").value = n.text || ""; }).catch(() => {});
   }
-
-  async function delDay() {
-    if (!confirm(`delete "${days.find(d => d.id === selectedId)?.label}" and its tasks?`)) return;
-    await api(`/api/days/${selectedId}`, "DELETE");
-    await load();
+  function noteChanged() {
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(saveNote, 600);
   }
-
-  async function carry() {
-    const res = await api(`/api/days/${selectedId}/carry`, "POST", {});
-    selectedId = res.moved_to;
-    await api("/api/current-day", "POST", {day_id: res.moved_to});
-    await load();
-  }
-
-  async function refreshUndo() {
+  async function saveNote() {
     try {
-      const u = await (await fetch("/api/days/undo-carry")).json();
-      $("undobtn").classList.toggle("hidden", !u.available);
+      await api("/api/note", "POST", {text: $("notebox").value});
+      const el = $("notesaved");
+      el.classList.add("show");
+      setTimeout(() => el.classList.remove("show"), 1100);
     } catch (e) {}
-  }
-
-  async function undoCarry() {
-    await api("/api/days/undo-carry", "POST", {});
-    selectedId = null;
-    await load();
   }
 
   // ---------- timer view
@@ -1472,7 +1655,7 @@ MANAGE = """<!doctype html>
   function updateTitle() {
     if (!pomo) return;
     const ms = pomo.running ? Math.max(0, deadline - Date.now()) : pomo.remaining_ms;
-    document.title = fmtClock(ms) + " · " + fmtHM(pomo.today.focused_min) + " · obs-todo";
+    document.title = fmtClock(ms) + " · " + fmtHM(pomo.today.focused_min) + " · grind";
   }
 
   function renderTime() {
@@ -1541,6 +1724,7 @@ MANAGE = """<!doctype html>
     $("btn-toggle").textContent = pomo.running ? "pause" : pomo.ended || pomo.remaining_ms <= 0 ? "start next" : "start";
     $("tsum").innerHTML = `today <b>${fmtHM(pomo.today.focused_min)}</b>`;
     loadCats();
+    loadSubjects();
   }
   let catSig = "";
   async function loadCats() {
@@ -1596,6 +1780,31 @@ MANAGE = """<!doctype html>
     await api(`/api/categories/${id}`, "DELETE");
     await pomoSetCat(null);
   }
+  let subsSig = "";
+  async function loadSubjects() {
+    const sel = $("subj");
+    if (!sel) return;
+    let data;
+    try { data = await api("/api/tracker"); } catch (e) { return; }
+    const opts = [];
+    data.groups.forEach(g => {
+      const ss = g.subjects.filter(s => s.state !== "dropped");
+      if (!ss.length) return;
+      opts.push(`<optgroup label="${esc(g.name)}">` + ss.map(s =>
+        `<option value="${s.id}">${esc(s.name)}</option>`).join("") + `</optgroup>`);
+    });
+    const curId = pomo && pomo.subject ? pomo.subject.id : "";
+    const sig = JSON.stringify(opts) + "|" + curId;
+    if (sig === subsSig) return;
+    subsSig = sig;
+    sel.innerHTML = `<option value="">none</option>` + opts.join("");
+    sel.value = curId;
+  }
+  async function pomoSetSubj(v) {
+    pomo = await api("/api/pomodoro", "POST", {action: "set", subject_id: v});
+    subsSig = "";
+    loadSubjects();
+  }
 
   // ---------- summary view
   async function loadSummary() {
@@ -1609,25 +1818,65 @@ MANAGE = """<!doctype html>
     $("statgrid").innerHTML = stats.map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
     drawDaily($("ch-daily"), s.daily_categories);
     drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
-    drawBars($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
+    drawMonthRows($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
+    api("/api/tracker").then(t => {
+      trkTotals = t.totals;
+      renderTrkStats();
+    }).catch(() => {});
   }
-  function dayCard() { window.open("/card.png", "_blank"); }
-  function weekCard() { window.open("/card-week.png", "_blank"); }
-  function monthCard() { window.open("/card-month.png", "_blank"); }
+  function toggleCardMenu(ev) {
+    ev.stopPropagation();
+    const m = $("cardmenu");
+    m.hidden = !m.hidden;
+    if (!m.hidden) setTimeout(() => document.addEventListener("click", closeCardMenu, {once: true}), 0);
+  }
+  function closeCardMenu() { $("cardmenu").hidden = true; }
+  function exportCard(kind) {
+    closeCardMenu();
+    window.open(kind === "day" ? "/card.png" : kind === "week" ? "/card-week.png" : "/card-month.png", "_blank");
+  }
+  let trkStatsOpen = false, trkTotals = null;
+  function renderTrkStats() {
+    if (!trkTotals) return;
+    const all = [
+      [trkTotals.active, "in progress"],
+      [trkTotals.stale, "flagged stale"],
+      [fmtHM(trkTotals.focused_min), "invested"],
+    ];
+    const show = trkStatsOpen ? all : [];
+    $("trkstatgrid").innerHTML = show.map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
+    $("trktwist").innerHTML = trkStatsOpen ? "&#9662;" : "&#9656;";
+  }
+  function toggleTrkStats() { trkStatsOpen = !trkStatsOpen; renderTrkStats(); }
   function drawDaily(el, days) {
     const cats = [];
     days.forEach(d => d.cats.forEach(c => { if (!cats.includes(c.name)) cats.push(c.name); }));
-    const shades = ["#eaeaec", "#8f8f93", "#57575a", "#c4c4c8", "#3f3f43", "#a8a8ac", "#6f6f73", "#2e2e31"];
+    const shades = ["#c9c9ce", "#8f8f93", "#57575a", "#a8a8ac", "#3f3f43", "#6f6f73", "#dedee2", "#2e2e31"];
     const shade = name => shades[cats.indexOf(name) % shades.length];
     const legend = cats.length
       ? `<div class="legend">` + cats.map(c => `<span><i style="background:${shade(c)}"></i>${esc(c)}</span>`).join("") + `</div>`
       : `<div class="empty" style="padding:4px 0">no focus in the last 7 days</div>`;
-    const rows = days.map(d => {
-      const segs = d.total ? d.cats.map(c =>
-        `<i style="flex:${c.min}; background:${shade(c.name)}" title="${esc(c.name)}: ${fmtHM(c.min)}"></i>`).join("") : "";
-      return `<div class="drow"><s>${esc(d.label)} ${d.date.slice(8)}</s><div class="dbar">${segs}</div><b>${fmtHM(d.total)}</b></div>`;
+    const MAXMIN = 360;
+    const grid = [0, 2, 4, 6].map(h =>
+      `<div class="gline" style="bottom:${(h / 6 * 100).toFixed(3)}%"><s>${h}h</s></div>`).join("");
+    const cols = days.map(d => {
+      const segs = d.cats.map(c =>
+        `<i style="flex:${c.min}; background:${shade(c.name)}" title="${esc(c.name)}: ${fmtHM(c.min)}"></i>`).join("");
+      const h = d.total ? Math.min(100, 100 * d.total / MAXMIN).toFixed(1) : 0;
+      return `<div class="hcol">
+        <b>${d.total ? fmtHM(d.total) : ""}</b>
+        <div class="hstack" style="height:${h}%">${segs}</div>
+        <s>${esc(d.label)}</s>
+      </div>`;
     }).join("");
-    el.innerHTML = legend + rows;
+    el.innerHTML = legend + `<div class="histplot"><div class="histgrid">${grid}</div><div class="hist">${cols}</div></div>`;
+  }
+  function drawMonthRows(el, months) {
+    if (!months.length) { el.innerHTML = `<div class="empty" style="padding:4px 0">no months tracked yet</div>`; return; }
+    const max = Math.max(1, ...months.map(m => m.v));
+    el.innerHTML = months.map(m =>
+      `<div class="mrow"><s>${esc(m.l)}</s><div class="mbar"><i style="width:${Math.max(2, 100 * m.v / max).toFixed(1)}%"></i></div><b>${fmtHM(m.v)}</b></div>`
+    ).join("");
   }
   function drawBars(el, data) {
     if (!data.length) { el.innerHTML = `<div class="empty">no data</div>`; return; }
@@ -1642,24 +1891,6 @@ MANAGE = """<!doctype html>
     }).join("");
   }
 
-  // ---------- session switching (day tabs as sessions)
-  function toggleDayTabs() {
-    $("tabs").classList.toggle("hidden");
-  }
-  function fillSessPick() {
-    const sel = $("sesspick");
-    if (!sel) return;
-    const rows = [...days].sort((a, b) => b.position - a.position);
-    sel.innerHTML = rows.map(d =>
-      `<option value="${d.id}" ${d.id === currentDayId ? "selected" : ""}>${esc(d.label)}</option>`).join("");
-  }
-  async function switchSession(id) {
-    await api("/api/current-day", "POST", {day_id: id});
-    selectedId = null;
-    $("tabs").classList.add("hidden");
-    await load();
-  }
-
   // ---------- drag to reorder tasks
   let dragId = null;
   function onDragStart(id, ev) {
@@ -1670,14 +1901,12 @@ MANAGE = """<!doctype html>
   async function onDrop(targetId, ev) {
     ev.preventDefault();
     if (dragId === null || dragId === targetId) return;
-    const day = days.find(d => d.id === selectedId);
-    if (!day) return;
-    const vis = day.tasks.filter(t => t.state !== "done").map(t => t.id);
+    const vis = tasks.filter(t => t.state !== "done").map(t => t.id);
     const from = vis.indexOf(dragId), to = vis.indexOf(targetId);
     dragId = null;
     if (from < 0 || to < 0) return;
     vis.splice(to, 0, vis.splice(from, 1)[0]);
-    await api("/api/tasks/reorder", "POST", {day_id: day.id, order: vis});
+    await api("/api/tasks/reorder", "POST", {order: vis});
     await load(true);
   }
 
@@ -1715,6 +1944,376 @@ MANAGE = """<!doctype html>
     }
   }
 
+  // ---------- tracker view
+  let trk = null, trkEditorId = null, trkSnoozeId = null, trkMenuId = null;
+  let trkCollapsed = JSON.parse(localStorage.getItem("obstodo_trk_collapsed") || "[]");
+  let trkDoneCollapsed = localStorage.getItem("obstodo_trk_done") !== "0";
+  let trkDropCollapsed = localStorage.getItem("obstodo_trk_drop") !== "0";
+  const TSTATE_GLYPH = {todo: "&#9675;", doing: "&#9679;", done: "&#10003;", paused: "&#10073;&#10073;", dropped: "&#10005;"};
+
+  function fmtDate(iso) {
+    if (!iso) return "";
+    const dt = new Date(iso + "T00:00:00");
+    return isNaN(dt) ? iso : dt.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+  }
+  function findSubj(id) {
+    for (const g of trk.groups) {
+      const s = g.subjects.find(x => x.id === id);
+      if (s) return s;
+    }
+    return null;
+  }
+
+  async function loadTracker() {
+    trk = await api("/api/tracker");
+    renderTracker();
+    renderFocus();
+    if (trkEditorId !== null && !findSubj(trkEditorId)) trkEditorId = null;
+  }
+
+  function renderFocus() {
+    const el = $("trkfocus");
+    if (!el || el.querySelector("input")) return;
+    const f = (trk && trk.focus) || "";
+    el.textContent = f || "set the focus for this week...";
+    el.classList.toggle("dim", !f);
+  }
+  function editFocus() {
+    const el = $("trkfocus");
+    if (el.querySelector("input")) return;
+    const cur = (trk && trk.focus) || "";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "focusinput";
+    input.value = cur;
+    el.textContent = "";
+    el.classList.remove("dim");
+    el.appendChild(input);
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    let done = false;
+    const finish = async save => {
+      if (done) return;
+      done = true;
+      const v = input.value.trim();
+      if (save && v !== cur) {
+        try {
+          await api("/api/tracker/settings", "POST", {focus: v});
+          if (trk) trk.focus = v;
+        } catch (e) {}
+      }
+      renderFocus();
+    };
+    input.addEventListener("keydown", e => {
+      e.stopPropagation();
+      if (e.key === "Enter") finish(true);
+      else if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("click", e => e.stopPropagation());
+  }
+
+  function renderTracker() {
+    if (!trk) return;
+    $("trkgroups").innerHTML = trk.groups.length
+      ? trk.groups.map(groupHtml).join("")
+      : `<div class="empty">no groups yet, hit + to add one (e.g. stream processing)</div>`;
+  }
+
+  function groupHtml(g) {
+    const collapsed = trkCollapsed.includes(g.id);
+    let body = "";
+    if (!collapsed) {
+      const openSubs = g.subjects.filter(s => s.state !== "done" && s.state !== "dropped");
+      const doneSubs = g.subjects.filter(s => s.state === "done");
+      const dropSubs = g.subjects.filter(s => s.state === "dropped");
+      body = openSubs.map(s => subjectHtml(g, s)).join("");
+      if (doneSubs.length) {
+        body += `<div class="donehead" onclick="toggleTrkDone()"><span class="arrow">${trkDoneCollapsed ? "&#9656;" : "&#9662;"}</span> done (${doneSubs.length})</div>`;
+        if (!trkDoneCollapsed) body += doneSubs.map(s => subjectHtml(g, s)).join("");
+      }
+      if (dropSubs.length) {
+        body += `<div class="donehead" onclick="toggleTrkDrop()"><span class="arrow">${trkDropCollapsed ? "&#9656;" : "&#9662;"}</span> dropped (${dropSubs.length})</div>`;
+        if (!trkDropCollapsed) body += dropSubs.map(s => subjectHtml(g, s)).join("");
+      }
+      body += addSubHtml(g.id);
+    }
+    return `<div class="group">
+      <div class="ghead" draggable="true" ondragstart="gDragStart(${g.id}, event)" ondragover="gDragOver(event)" ondrop="gDrop(${g.id}, event)" onclick="toggleGroup(${g.id})">
+        <span class="garrow">${collapsed ? "&#9656;" : "&#9662;"}</span>
+        <span class="gname" title="click to rename" onclick="renameGroup(${g.id}, event)">${esc(g.name)}</span>
+        <div class="gbar"><i style="width:${g.pct === null ? 0 : g.pct}%"></i></div>
+        <span class="gpct">${g.pct === null ? "&ndash;" : g.pct + "%"}</span>
+        <span class="gmeta">${g.done}/${g.count} done</span>
+        <button class="delbtn" title="delete group" onclick="delGroup(${g.id}, event)">&#128465;</button>
+      </div>
+      <div class="gbody">${body}</div>
+    </div>`;
+  }
+
+  function addSubHtml(gid) {
+    return `<button class="tool addreveal" id="addbtn-${gid}" title="add subject" onclick="revealAddSub(${gid})">&#43;</button>
+      <div class="addsub hidden" id="addsub-${gid}">
+        <input type="text" id="ns-${gid}" placeholder="add subject..." onkeydown="if(event.key==='Enter')addSubject(${gid});else if(event.key==='Escape')hideAddSub(${gid})">
+        <button class="tool pri" onclick="addSubject(${gid})">add</button>
+      </div>`;
+  }
+  function revealAddSub(gid) {
+    $(`addbtn-${gid}`).classList.add("hidden");
+    $(`addsub-${gid}`).classList.remove("hidden");
+    $(`ns-${gid}`).focus();
+  }
+  function hideAddSub(gid) {
+    $(`addsub-${gid}`).classList.add("hidden");
+    $(`ns-${gid}`).value = "";
+    $(`addbtn-${gid}`).classList.remove("hidden");
+  }
+
+  function subjectHtml(g, s) {
+    const open = trkEditorId === s.id;
+    let badge = "";
+    if (s.state === "paused") {
+      badge = `<span class="badge hold">on hold</span>`;
+    } else if (s.stale) {
+      badge = `<button class="badge stale" title="last touched ${s.last_touched ? s.last_touched.slice(0, 10) : "never"}, click to snooze" onclick="toggleSnooze(${s.id}, event)">&#9888; ${s.days_idle}d</button>`;
+    } else if (s.snoozed) {
+      badge = `<span class="badge zzz" title="${esc(s.snooze_reason || "flag snoozed")}">zzz until ${fmtDate(s.snooze_until)}</span>`;
+    }
+    const star = `<button class="star ${s.is_next ? "on" : ""}" title="${s.is_next ? "unstar (next up)" : "mark as next up"}" onclick="toggleNext(${s.id}, ${s.is_next ? 0 : 1}, event)">${s.is_next ? "&#9733;" : "&#9734;"}</button>`;
+    const stateBtn = `<button class="statebtn" title="${s.state}, click to cycle" onclick="cycleSubjState(${s.id}, '${s.state}', event)">${TSTATE_GLYPH[s.state] || "&#9675;"}</button>`;
+    const link = s.url ? `<a class="slink" href="${esc(s.url)}" target="_blank" rel="noopener" title="open resource">&#8599;</a>` : "";
+    const kebab = `<button class="kebab" title="more" onclick="toggleSubjMenu(${s.id}, event)">&#8943;</button>`;
+    const snoozeBar = trkSnoozeId === s.id
+      ? `<div class="snoozebar">snooze flag:
+          <button class="qadd" onclick="snoozeSubj(${s.id}, 7, event)">1w</button>
+          <button class="qadd" onclick="snoozeSubj(${s.id}, 14, event)">2w</button>
+          <button class="qadd" onclick="snoozeSubj(${s.id}, 30, event)">1m</button>
+          <button class="qadd" onclick="snoozeSubj(${s.id}, 0, event)">other&hellip;</button>
+          ${s.snoozed ? `<button class="qadd" onclick="unsnoozeSubj(${s.id}, event)">clear</button>` : ""}
+        </div>`
+      : "";
+    return `<div class="subj ${s.state}">
+      <div class="srow" draggable="true" ondragstart="sDragStart(${s.id}, event)" ondragover="sDragOver(event)" ondrop="sDrop(${g.id}, ${s.id}, event)">
+        ${star}${stateBtn}
+        <span class="sname" onclick="toggleSubjEditor(${s.id})">${esc(s.name)}${link}</span>
+        ${badge}
+        ${kebab}
+      </div>
+      ${snoozeBar}
+      ${trkMenuId === s.id ? subjMenuHtml(s) : ""}
+      ${open ? subjEditorHtml(s) : ""}
+    </div>`;
+  }
+
+  function subjMenuHtml(s) {
+    const items = [];
+    if (s.state !== "done" && s.state !== "dropped") {
+      items.push(s.state === "paused"
+        ? `<button class="menuitem" onclick="subjState(${s.id}, 'doing', event)">resume</button>`
+        : `<button class="menuitem" onclick="subjState(${s.id}, 'paused', event)">on hold</button>`);
+      items.push(`<button class="menuitem" onclick="subjState(${s.id}, 'dropped', event)">drop this</button>`);
+    }
+    if (s.state === "dropped") {
+      items.push(`<button class="menuitem" onclick="subjState(${s.id}, 'todo', event)">restore</button>`);
+    }
+    items.push(`<button class="menuitem danger" onclick="delSubject(${s.id}, event)">delete</button>`);
+    const head = s.focused_min ? `<div class="menuhead">${fmtHM(s.focused_min)} focused</div>` : "";
+    return `<div class="menu">${head}${items.join("")}</div>`;
+  }
+
+  function subjEditorHtml(s) {
+    return `<div class="editor open">
+      <div class="tedit">
+        <div><label>name</label><input type="text" id="te-name-${s.id}" value="${esc(s.name)}"></div>
+        <div><label>resource link (url)</label><input type="text" id="te-url-${s.id}" value="${esc(s.url)}" placeholder="https://..."></div>
+        <div><label>notes</label><textarea id="te-notes-${s.id}">${esc(s.notes)}</textarea></div>
+        <div style="display:flex; align-items:center; gap:8px">
+          <button class="tool pri" onclick="saveSubj(${s.id})">save</button>
+          <span class="saved" id="te-ok-${s.id}">saved &#10003;</span>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function toggleSubjEditor(id) {
+    trkEditorId = trkEditorId === id ? null : id;
+    trkMenuId = null;
+    if (trkEditorId === null) trkSnoozeId = null;
+    renderTracker();
+  }
+
+  async function addGroup() {
+    const name = (prompt("group name (e.g. stream processing)") || "").trim();
+    if (!name) return;
+    await api("/api/tracker/groups", "POST", {name});
+    await loadTracker();
+  }
+  async function renameGroup(id, ev) {
+    ev.stopPropagation();
+    const g = trk.groups.find(x => x.id === id);
+    const name = (prompt("rename group", g.name) || "").trim();
+    if (!name || name === g.name) return;
+    await api(`/api/tracker/groups/${id}`, "PATCH", {name});
+    await loadTracker();
+  }
+  async function delGroup(id, ev) {
+    ev.stopPropagation();
+    const g = trk.groups.find(x => x.id === id);
+    const n = g.subjects.length;
+    if (!confirm(`delete "${g.name}" and its ${n} subject${n === 1 ? "" : "s"}?`)) return;
+    await api(`/api/tracker/groups/${id}`, "DELETE");
+    if (trkEditorId !== null && !findSubj(trkEditorId)) trkEditorId = null;
+    await loadTracker();
+  }
+  function toggleGroup(id) {
+    const i = trkCollapsed.indexOf(id);
+    if (i >= 0) trkCollapsed.splice(i, 1); else trkCollapsed.push(id);
+    localStorage.setItem("obstodo_trk_collapsed", JSON.stringify(trkCollapsed));
+    renderTracker();
+  }
+  async function addSubject(gid) {
+    const el = $(`ns-${gid}`);
+    const name = el.value.trim();
+    if (!name) { hideAddSub(gid); return; }
+    await api("/api/tracker/subjects", "POST", {group_id: gid, name});
+    hideAddSub(gid);
+    await loadTracker();
+  }
+  async function patchSubj(id, fields) {
+    await api(`/api/tracker/subjects/${id}`, "PATCH", fields);
+    await loadTracker();
+  }
+  function subjState(id, state, ev) {
+    if (ev) ev.stopPropagation();
+    trkMenuId = null;
+    patchSubj(id, {state});
+  }
+  function cycleSubjState(id, state, ev) {
+    ev.stopPropagation();
+    const next = {todo: "doing", doing: "done", done: "todo", paused: "doing", dropped: "todo"}[state];
+    patchSubj(id, {state: next});
+  }
+  function toggleNext(id, on, ev) {
+    ev.stopPropagation();
+    patchSubj(id, {is_next: !!on});
+  }
+  async function delSubject(id, ev) {
+    ev.stopPropagation();
+    trkMenuId = null;
+    const s = findSubj(id);
+    if (!s || !confirm(`delete "${s.name}"? its progress log and focus-time link go too.`)) return;
+    await api(`/api/tracker/subjects/${id}`, "DELETE");
+    trkEditorId = null;
+    await loadTracker();
+  }
+  function toggleSubjMenu(id, ev) {
+    ev.stopPropagation();
+    trkMenuId = trkMenuId === id ? null : id;
+    renderTracker();
+    if (trkMenuId !== null) {
+      setTimeout(() => document.addEventListener("click", closeSubjMenu, {once: true}), 0);
+    }
+  }
+  function closeSubjMenu() {
+    if (trkMenuId !== null) {
+      trkMenuId = null;
+      renderTracker();
+    }
+  }
+  async function saveSubj(id) {
+    const name = $(`te-name-${id}`).value.trim();
+    if (!name) return;
+    await patchSubj(id, {
+      name,
+      url: $(`te-url-${id}`).value.trim(),
+      notes: $(`te-notes-${id}`).value,
+    });
+    flashSaved(id);
+  }
+  function flashSaved(id) {
+    const el = $(`te-ok-${id}`);
+    if (!el) return;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), 1200);
+  }
+  function toggleSnooze(id, ev) {
+    ev.stopPropagation();
+    trkSnoozeId = trkSnoozeId === id ? null : id;
+    renderTracker();
+  }
+  async function snoozeSubj(id, days, ev) {
+    ev.stopPropagation();
+    let body;
+    if (days > 0) body = {days};
+    else {
+      const d = parseInt(prompt("snooze for how many days?", "21") || "", 10);
+      if (!Number.isInteger(d)) return;
+      body = {days: d};
+    }
+    const reason = prompt("reason (optional, shows on the badge)", "") || "";
+    body.reason = reason;
+    await api(`/api/tracker/subjects/${id}/snooze`, "POST", body);
+    trkSnoozeId = null;
+    await loadTracker();
+  }
+  async function unsnoozeSubj(id, ev) {
+    ev.stopPropagation();
+    await api(`/api/tracker/subjects/${id}/snooze`, "POST", {clear: true});
+    trkSnoozeId = null;
+    await loadTracker();
+  }
+  function toggleTrkDone() {
+    trkDoneCollapsed = !trkDoneCollapsed;
+    localStorage.setItem("obstodo_trk_done", trkDoneCollapsed ? "1" : "0");
+    renderTracker();
+  }
+  function toggleTrkDrop() {
+    trkDropCollapsed = !trkDropCollapsed;
+    localStorage.setItem("obstodo_trk_drop", trkDropCollapsed ? "1" : "0");
+    renderTracker();
+  }
+
+  // ---------- drag to reorder tracker groups
+  let gDragId = null;
+  function gDragStart(id, ev) {
+    gDragId = id;
+    if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+  }
+  function gDragOver(ev) { ev.preventDefault(); }
+  async function gDrop(targetId, ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (gDragId === null || gDragId === targetId) return;
+    const order = trk.groups.map(g => g.id);
+    const from = order.indexOf(gDragId), to = order.indexOf(targetId);
+    gDragId = null;
+    if (from < 0 || to < 0) return;
+    order.splice(to, 0, order.splice(from, 1)[0]);
+    await api("/api/tracker/groups/reorder", "POST", {order});
+    await loadTracker();
+  }
+
+  let sDragId = null;
+  function sDragStart(id, ev) {
+    sDragId = id;
+    if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+  }
+  function sDragOver(ev) { ev.preventDefault(); }
+  async function sDrop(gid, targetId, ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (sDragId === null || sDragId === targetId) return;
+    const g = trk.groups.find(x => x.id === gid);
+    if (!g) return;
+    const order = g.subjects.map(s => s.id);
+    const from = order.indexOf(sDragId), to = order.indexOf(targetId);
+    sDragId = null;
+    if (from < 0 || to < 0) return;
+    order.splice(to, 0, order.splice(from, 1)[0]);
+    await api("/api/tracker/subjects/reorder", "POST", {order});
+    await loadTracker();
+  }
+
   document.addEventListener("keydown", e => {
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
@@ -1723,8 +2322,8 @@ MANAGE = """<!doctype html>
       if (pomo) pomoToggle();
       return;
     }
-    const map = {Digit1: "tasks", Digit2: "timer", Digit3: "summary", Digit4: "log",
-                 Numpad1: "tasks", Numpad2: "timer", Numpad3: "summary", Numpad4: "log"};
+    const map = {Digit1: "tasks", Digit2: "tracker", Digit3: "timer", Digit4: "summary", Digit5: "log",
+                 Numpad1: "tasks", Numpad2: "tracker", Numpad3: "timer", Numpad4: "summary", Numpad5: "log"};
     if (e.ctrlKey && !e.metaKey && map[e.code]) {
       e.preventDefault();
       switchView(map[e.code]);
@@ -1781,12 +2380,9 @@ def make_handler(db_path: str):
                 elif path == "/manage":
                     self._send(200, MANAGE.encode())
                 elif path == "/api/todo":
-                    payload = day_payload(conn, current_day_id(conn))
-                    self._json(200, payload)
-                elif path == "/api/days":
-                    self._json(200, manage_payload(conn))
-                elif path == "/api/days/undo-carry":
-                    self._json(200, {"available": bool(get_setting(conn, "last_carry"))})
+                    self._json(200, todo_payload(conn))
+                elif path == "/api/note":
+                    self._json(200, {"text": get_setting(conn, "scratchpad", "")})
                 elif path == "/api/pomodoro":
                     self._json(200, pomo_payload(conn))
                 elif path == "/api/pomodoro/log":
@@ -1810,18 +2406,6 @@ def make_handler(db_path: str):
                     })
                 elif path == "/api/pomodoro/summary":
                     self._json(200, pomo_summary(conn))
-                elif path == "/api/sessions":
-                    rows = conn.execute(
-                        "SELECT d.id, d.label, d.position, COUNT(p.id) AS blocks, "
-                        "COALESCE(SUM(p.minutes),0) AS focused_min "
-                        "FROM days d LEFT JOIN pomo_periods p ON p.day_id=d.id "
-                        "GROUP BY d.id ORDER BY d.position DESC"
-                    ).fetchall()
-                    self._json(200, [
-                        {"id": r["id"], "label": r["label"], "position": r["position"], "blocks": r["blocks"],
-                         "focused_min": r["focused_min"]}
-                        for r in rows
-                    ])
                 elif path == "/api/categories":
                     cats = []
                     for c in conn.execute(
@@ -1835,8 +2419,20 @@ def make_handler(db_path: str):
                     ).fetchone()[0]
                     cats.insert(0, {"id": None, "name": "Unallocated", "total_min": unalloc})
                     self._json(200, cats)
+                elif path == "/api/tracker":
+                    self._json(200, tracker_payload(conn))
+                elif path == "/api/tracker/settings":
+                    self._json(200, {"stale_days": tracker_stale_days(conn),
+                                     "focus": get_setting(conn, "tracker_focus", "")})
                 else:
-                    self._json(404, {"error": "not found"})
+                    m = re.match(r"^/api/tracker/subjects/(\d+)/history$", path)
+                    if m:
+                        sid = int(m.group(1))
+                        if not conn.execute("SELECT 1 FROM tracker_subjects WHERE id=?", (sid,)).fetchone():
+                            return self._json(404, {"error": "subject not found"})
+                        self._json(200, {"history": tracker_subject_history(conn, sid)})
+                    else:
+                        self._json(404, {"error": "not found"})
             except ValueError as e:
                 self._json(400, {"error": str(e)})
             finally:
@@ -1846,73 +2442,34 @@ def make_handler(db_path: str):
             conn = get_db(db_path)
             try:
                 body = self._body()
-                if self.path == "/api/days":
-                    day = create_day(conn, (body.get("label") or "").strip() or None)
-                    self._json(201, {"id": day["id"], "label": day["label"]})
-                elif self.path == "/api/days/undo-carry":
-                    raw = get_setting(conn, "last_carry")
-                    if not raw:
-                        return self._json(400, {"error": "nothing to undo"})
-                    try:
-                        snap = json.loads(raw)
-                    except json.JSONDecodeError:
-                        return self._json(400, {"error": "corrupt snapshot"})
-                    restored = 0
-                    for t in snap.get("tasks", []):
-                        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (t["id"],)).fetchone():
-                            conn.execute("UPDATE tasks SET day_id=?, position=? WHERE id=?",
-                                         (t["day_id"], t["position"], t["id"]))
-                            restored += 1
-                    set_setting(conn, "last_carry", "")
+                if self.path == "/api/note":
+                    text = str(body.get("text") or "")[:20000]
+                    set_setting(conn, "scratchpad", text)
                     conn.commit()
-                    self._json(200, {"restored": restored})
-                elif self.path == "/api/current-day":
-                    day = conn.execute("SELECT id FROM days WHERE id=?", (body.get("day_id"),)).fetchone()
-                    if not day:
-                        return self._json(404, {"error": "day not found"})
-                    set_setting(conn, "current_day_id", day["id"])
-                    conn.commit()
-                    self._json(200, {"current_day_id": day["id"]})
+                    self._json(200, {"saved": True})
                 elif self.path == "/api/tasks":
-                    day = conn.execute("SELECT id FROM days WHERE id=?", (body.get("day_id"),)).fetchone()
                     text = (body.get("text") or "").strip()
-                    if not day:
-                        return self._json(404, {"error": "day not found"})
                     if not text:
                         return self._json(400, {"error": "text required"})
+                    pos = conn.execute("SELECT COALESCE(MAX(position),0)+1 FROM tasks").fetchone()[0]
                     cur = conn.execute(
                         "INSERT INTO tasks (day_id, text, details, position) VALUES (?,?,?,?)",
-                        (day["id"], text, (body.get("details") or "").strip(), next_position(conn, day["id"])),
+                        (current_day_id(conn), text, (body.get("details") or "").strip(), pos),
                     )
                     conn.commit()
                     self._json(201, {"id": cur.lastrowid})
                 elif self.path == "/api/tasks/reorder":
-                    day_id = body.get("day_id")
                     order = [int(i) for i in (body.get("order") or [])]
-                    day = conn.execute("SELECT id FROM days WHERE id=?", (day_id,)).fetchone()
-                    if not day:
-                        return self._json(404, {"error": "day not found"})
                     if order:
                         marks = ",".join("?" for _ in order)
                         owned = conn.execute(
-                            f"SELECT COUNT(*) FROM tasks WHERE day_id=? AND id IN ({marks})",
-                            [day_id] + order,
+                            f"SELECT COUNT(*) FROM tasks WHERE id IN ({marks})", order,
                         ).fetchone()[0]
                         if owned != len(set(order)):
-                            return self._json(400, {"error": "order must contain only this day's tasks"})
-                        base = conn.execute(
-                            "SELECT COALESCE(MAX(position),0) FROM tasks WHERE day_id=?", (day_id,)
-                        ).fetchone()[0]
+                            return self._json(400, {"error": "order must contain only task ids"})
+                        base = conn.execute("SELECT COALESCE(MAX(position),0) FROM tasks").fetchone()[0]
                         for n, tid in enumerate(order):
                             conn.execute("UPDATE tasks SET position=? WHERE id=?", (base + 1 + n, tid))
-                        done = conn.execute(
-                            f"SELECT id FROM tasks WHERE day_id=? AND state='done' AND id NOT IN ({marks}) "
-                            "ORDER BY position",
-                            [day_id] + order,
-                        ).fetchall()
-                        for n, r in enumerate(done):
-                            conn.execute("UPDATE tasks SET position=? WHERE id=?",
-                                         (base + 1 + len(order) + n, r["id"]))
                         conn.commit()
                     self._json(200, {"ordered": len(order)})
                 elif self.path == "/api/pomodoro":
@@ -1930,33 +2487,129 @@ def make_handler(db_path: str):
                     cur = conn.execute("INSERT INTO categories (name, position) VALUES (?,?)", (name, pos))
                     conn.commit()
                     self._json(201, {"id": cur.lastrowid, "name": name})
-                elif self.path.endswith("/carry"):
-                    day_id = self._path_id(r"^/api/days/(\d+)/carry$")
-                    day = conn.execute("SELECT * FROM days WHERE id=?", (day_id,)).fetchone()
-                    if not day:
-                        return self._json(404, {"error": "day not found"})
-                    nxt = conn.execute(
-                        "SELECT * FROM days WHERE position>? ORDER BY position LIMIT 1", (day["position"],)
-                    ).fetchone()
-                    if not nxt:
-                        nxt = create_day(conn)
-                    src_rows = conn.execute(
-                        "SELECT id, day_id, position FROM tasks WHERE day_id=? AND state!='done' ORDER BY position",
-                        (day_id,),
-                    ).fetchall()
-                    set_setting(conn, "last_carry", json.dumps({
-                        "to_day": nxt["id"],
-                        "tasks": [{"id": t["id"], "day_id": t["day_id"], "position": t["position"]} for t in src_rows],
-                    }))
-                    base = next_position(conn, nxt["id"])
-                    for n, t in enumerate(src_rows):
-                        conn.execute(
-                            "UPDATE tasks SET day_id=?, position=? WHERE id=?",
-                            (nxt["id"], base + n, t["id"]),
-                        )
+                elif self.path == "/api/tracker/groups":
+                    name = (body.get("name") or "").strip()
+                    if not name:
+                        return self._json(400, {"error": "name required"})
+                    pos = conn.execute("SELECT COALESCE(MAX(position),0)+1 FROM tracker_groups").fetchone()[0]
+                    cur = conn.execute("INSERT INTO tracker_groups (name, position) VALUES (?,?)", (name, pos))
                     conn.commit()
-                    self._json(200, {"moved": len(src_rows), "moved_to": nxt["id"]})
+                    self._json(201, {"id": cur.lastrowid, "name": name})
+                elif self.path == "/api/tracker/subjects":
+                    gid = body.get("group_id")
+                    if not conn.execute("SELECT 1 FROM tracker_groups WHERE id=?", (gid,)).fetchone():
+                        return self._json(404, {"error": "group not found"})
+                    name = (body.get("name") or "").strip()
+                    if not name:
+                        return self._json(400, {"error": "name required"})
+                    kind = body.get("kind") or "other"
+                    if kind not in TRACKER_KINDS:
+                        return self._json(400, {"error": "kind must be one of " + "|".join(TRACKER_KINDS)})
+                    total = body.get("unit_total")
+                    if total in (None, ""):
+                        total = TRACKER_KINDS[kind]["total"]
+                    else:
+                        try:
+                            total = float(total)
+                            if total <= 0:
+                                raise ValueError
+                        except (TypeError, ValueError):
+                            return self._json(400, {"error": "unit_total must be a positive number"})
+                    pos = conn.execute(
+                        "SELECT COALESCE(MAX(position),0)+1 FROM tracker_subjects WHERE group_id=?", (gid,),
+                    ).fetchone()[0]
+                    cur = conn.execute(
+                        "INSERT INTO tracker_subjects (group_id, name, kind, url, unit_total, unit_label, notes, position) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (gid, name, kind, (body.get("url") or "").strip(), total,
+                         TRACKER_KINDS[kind]["label"], (body.get("notes") or "").strip(), pos),
+                    )
+                    conn.commit()
+                    self._json(201, {"id": cur.lastrowid})
+                elif self.path == "/api/tracker/settings":
+                    if "focus" in body:
+                        focus = str(body.get("focus") or "").strip()[:300]
+                        set_setting(conn, "tracker_focus", focus)
+                        conn.commit()
+                        return self._json(200, {"focus": focus})
+                    try:
+                        n = int(body.get("stale_days"))
+                    except (TypeError, ValueError):
+                        return self._json(400, {"error": "stale_days must be an integer"})
+                    if not 1 <= n <= 365:
+                        return self._json(400, {"error": "stale_days must be 1..365"})
+                    set_setting(conn, "tracker_stale_days", n)
+                    conn.commit()
+                    self._json(200, {"stale_days": n})
                 else:
+                    m = re.match(r"^/api/tracker/subjects/(\d+)/progress$", self.path)
+                    if m:
+                        self._json(200, tracker_progress(conn, int(m.group(1)), body))
+                        return
+                    m = re.match(r"^/api/tracker/subjects/(\d+)/snooze$", self.path)
+                    if m:
+                        s = conn.execute("SELECT * FROM tracker_subjects WHERE id=?", (m.group(1),)).fetchone()
+                        if not s:
+                            return self._json(404, {"error": "subject not found"})
+                        if body.get("clear"):
+                            conn.execute(
+                                "UPDATE tracker_subjects SET snooze_until=NULL, snooze_reason='' WHERE id=?",
+                                (s["id"],),
+                            )
+                        else:
+                            if "days" in body:
+                                try:
+                                    days = int(body["days"])
+                                except (TypeError, ValueError):
+                                    return self._json(400, {"error": "days must be an integer"})
+                                if not 1 <= days <= 365:
+                                    return self._json(400, {"error": "days must be 1..365"})
+                                until = (date.today() + timedelta(days=days)).isoformat()
+                            else:
+                                until = str(body.get("until") or "").strip()
+                                try:
+                                    if not 0 <= (date.fromisoformat(until) - date.today()).days <= 365:
+                                        raise ValueError
+                                except ValueError:
+                                    return self._json(400, {"error": "until must be a valid future date"})
+                            reason = (body.get("reason") or "").strip()
+                            conn.execute(
+                                "UPDATE tracker_subjects SET snooze_until=?, snooze_reason=? WHERE id=?",
+                                (until, reason, s["id"]),
+                            )
+                        conn.commit()
+                        self._json(200, {"id": s["id"]})
+                        return
+                    if self.path == "/api/tracker/groups/reorder":
+                        order = [int(i) for i in (body.get("order") or [])]
+                        if not order:
+                            return self._json(400, {"error": "order required"})
+                        marks = ",".join("?" for _ in order)
+                        owned = conn.execute(
+                            f"SELECT COUNT(*) FROM tracker_groups WHERE id IN ({marks})", order,
+                        ).fetchone()[0]
+                        if owned != len(set(order)):
+                            return self._json(400, {"error": "order must contain only group ids"})
+                        for n, gid in enumerate(order):
+                            conn.execute("UPDATE tracker_groups SET position=? WHERE id=?", (n + 1, gid))
+                        conn.commit()
+                        self._json(200, {"ordered": len(order)})
+                        return
+                    if self.path == "/api/tracker/subjects/reorder":
+                        order = [int(i) for i in (body.get("order") or [])]
+                        if not order:
+                            return self._json(400, {"error": "order required"})
+                        marks = ",".join("?" for _ in order)
+                        owned = conn.execute(
+                            f"SELECT COUNT(*) FROM tracker_subjects WHERE id IN ({marks})", order,
+                        ).fetchone()[0]
+                        if owned != len(set(order)):
+                            return self._json(400, {"error": "order must contain only subject ids"})
+                        for n, sid in enumerate(order):
+                            conn.execute("UPDATE tracker_subjects SET position=? WHERE id=?", (n + 1, sid))
+                        conn.commit()
+                        self._json(200, {"ordered": len(order)})
+                        return
                     self._json(404, {"error": "not found"})
             except ValueError as e:
                 self._json(400, {"error": str(e)})
@@ -1966,17 +2619,6 @@ def make_handler(db_path: str):
         def do_PATCH(self):
             conn = get_db(db_path)
             try:
-                day_id = self._path_id(r"^/api/days/(\d+)$")
-                if day_id:
-                    day = conn.execute("SELECT id FROM days WHERE id=?", (day_id,)).fetchone()
-                    if not day:
-                        return self._json(404, {"error": "day not found"})
-                    label = (self._body().get("label") or "").strip()
-                    if not label:
-                        return self._json(400, {"error": "label cannot be empty"})
-                    conn.execute("UPDATE days SET label=? WHERE id=?", (label, day_id))
-                    conn.commit()
-                    return self._json(200, {"id": day_id, "label": label})
                 task_id = self._path_id(r"^/api/tasks/(\d+)$")
                 if task_id:
                     task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -2020,6 +2662,77 @@ def make_handler(db_path: str):
                     except sqlite3.IntegrityError:
                         return self._json(400, {"error": "category already exists"})
                     return self._json(200, {"id": cat_id, "name": name})
+                trk_group_id = self._path_id(r"^/api/tracker/groups/(\d+)$")
+                if trk_group_id:
+                    if not conn.execute("SELECT 1 FROM tracker_groups WHERE id=?", (trk_group_id,)).fetchone():
+                        return self._json(404, {"error": "group not found"})
+                    name = (self._body().get("name") or "").strip()
+                    if not name:
+                        return self._json(400, {"error": "name cannot be empty"})
+                    conn.execute("UPDATE tracker_groups SET name=? WHERE id=?", (name, trk_group_id))
+                    conn.commit()
+                    return self._json(200, {"id": trk_group_id, "name": name})
+                trk_subj_id = self._path_id(r"^/api/tracker/subjects/(\d+)$")
+                if trk_subj_id:
+                    s = conn.execute("SELECT * FROM tracker_subjects WHERE id=?", (trk_subj_id,)).fetchone()
+                    if not s:
+                        return self._json(404, {"error": "subject not found"})
+                    body = self._body()
+                    updates, params = [], []
+                    if "name" in body:
+                        name = (body["name"] or "").strip()
+                        if not name:
+                            return self._json(400, {"error": "name cannot be empty"})
+                        updates.append("name=?"); params.append(name)
+                    if "kind" in body:
+                        if body["kind"] not in TRACKER_KINDS:
+                            return self._json(400, {"error": "kind must be one of " + "|".join(TRACKER_KINDS)})
+                        updates.append("kind=?"); params.append(body["kind"])
+                    if "url" in body:
+                        updates.append("url=?"); params.append((body["url"] or "").strip())
+                    if "unit_label" in body:
+                        updates.append("unit_label=?"); params.append((body["unit_label"] or "").strip())
+                    if "position_at" in body:
+                        updates.append("position_at=?"); params.append(str(body["position_at"]).strip())
+                    if "notes" in body:
+                        updates.append("notes=?"); params.append(str(body["notes"]))
+                    if "unit_total" in body:
+                        t = body["unit_total"]
+                        if t in (None, ""):
+                            updates.append("unit_total=?"); params.append(None)
+                        else:
+                            try:
+                                t = float(t)
+                                if t <= 0:
+                                    raise ValueError
+                            except (TypeError, ValueError):
+                                return self._json(400, {"error": "unit_total must be a positive number"})
+                            updates.append("unit_total=?"); params.append(t)
+                    if "unit_done" in body:
+                        return self._json(400, {"error": "use /progress to change progress"})
+                    if "state" in body:
+                        if body["state"] not in TRACKER_STATES:
+                            return self._json(400, {"error": "state must be " + "|".join(TRACKER_STATES)})
+                        new_state = body["state"]
+                        updates.append("state=?"); params.append(new_state)
+                        updates.append("last_touched=?"); params.append(now_iso())
+                        if new_state == "doing":
+                            updates.append("started_at=COALESCE(started_at, ?)"); params.append(now_iso())
+                        if new_state == "done":
+                            updates.append("finished_at=COALESCE(finished_at, ?)"); params.append(now_iso())
+                        else:
+                            updates.append("finished_at=?"); params.append(None)
+                    if "is_next" in body:
+                        want = bool(body["is_next"])
+                        updates.append("is_next=?"); params.append(1 if want else 0)
+                        if want:
+                            conn.execute("UPDATE tracker_subjects SET is_next=0 WHERE group_id=?", (s["group_id"],))
+                    if not updates:
+                        return self._json(400, {"error": "nothing to update"})
+                    params.append(trk_subj_id)
+                    conn.execute(f"UPDATE tracker_subjects SET {', '.join(updates)} WHERE id=?", params)
+                    conn.commit()
+                    return self._json(200, {"id": trk_subj_id})
                 self._json(404, {"error": "not found"})
             except ValueError as e:
                 self._json(400, {"error": str(e)})
@@ -2034,17 +2747,6 @@ def make_handler(db_path: str):
                     if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
                         return self._json(404, {"error": "task not found"})
                     conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-                    conn.commit()
-                    return self._send(204, b"")
-                day_id = self._path_id(r"^/api/days/(\d+)$")
-                if day_id:
-                    total = conn.execute("SELECT COUNT(*) FROM days").fetchone()[0]
-                    if total <= 1:
-                        return self._json(400, {"error": "cannot delete the last day"})
-                    if not conn.execute("SELECT 1 FROM days WHERE id=?", (day_id,)).fetchone():
-                        return self._json(404, {"error": "day not found"})
-                    conn.execute("DELETE FROM days WHERE id=?", (day_id,))
-                    set_setting(conn, "current_day_id", current_day_id(conn))
                     conn.commit()
                     return self._send(204, b"")
                 period_id = self._path_id(r"^/api/pomodoro/periods/(\d+)$")
@@ -2065,6 +2767,27 @@ def make_handler(db_path: str):
                         save_pomo_state(conn, st)
                     if st.get("block_category_id") == cat_id:
                         st["block_category_id"] = None
+                        save_pomo_state(conn, st)
+                    conn.commit()
+                    return self._send(204, b"")
+                trk_group_id = self._path_id(r"^/api/tracker/groups/(\d+)$")
+                if trk_group_id:
+                    if not conn.execute("SELECT 1 FROM tracker_groups WHERE id=?", (trk_group_id,)).fetchone():
+                        return self._json(404, {"error": "group not found"})
+                    conn.execute("DELETE FROM tracker_groups WHERE id=?", (trk_group_id,))
+                    conn.commit()
+                    return self._json(200, {"deleted": trk_group_id})
+                trk_subj_id = self._path_id(r"^/api/tracker/subjects/(\d+)$")
+                if trk_subj_id:
+                    if not conn.execute("SELECT 1 FROM tracker_subjects WHERE id=?", (trk_subj_id,)).fetchone():
+                        return self._json(404, {"error": "subject not found"})
+                    conn.execute("DELETE FROM tracker_subjects WHERE id=?", (trk_subj_id,))
+                    st = get_pomo_state(conn)
+                    if st.get("subject_id") == trk_subj_id:
+                        st["subject_id"] = None
+                        save_pomo_state(conn, st)
+                    if st.get("block_subject_id") == trk_subj_id:
+                        st["block_subject_id"] = None
                         save_pomo_state(conn, st)
                     conn.commit()
                     return self._send(204, b"")
