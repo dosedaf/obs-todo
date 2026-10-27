@@ -9,7 +9,7 @@ Terminal=false
 Categories=Office;ProjectManagement;
 Keywords=todo;tasks;pomodoro;tracker;focus;lock in;
 StartupNotify=true
-StartupWMClass=LockIn
+StartupWMClass=org.lockin.app
 Actions=overlay;card;
 
 [Desktop Action overlay]

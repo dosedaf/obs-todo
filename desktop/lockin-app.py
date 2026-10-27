@@ -15,7 +15,7 @@ gi.require_version("Adw", "1")
 gi.require_version("WebKit", "6.0")
 from gi.repository import Adw, GLib, Gio, Gtk, WebKit
 
-APP_ID = "LockIn"
+APP_ID = "org.lockin.app"
 BASE = "http://localhost:8787"
 URL = BASE + "/manage"
 SERVICE = "obs-todo"
@@ -49,7 +49,7 @@ class LockInWindow(Adw.ApplicationWindow):
         self.set_content(overlay)
         self.install_action("win.reload", None, lambda w, a, p: self.reload())
         self.add_shortcut(Gtk.Shortcut.new(
-            Gtk.KeyTrigger.new("r", Gtk.ModifierType.CONTROL_MASK),
+            Gtk.ShortcutTrigger.parse_string("<Control>r"),
             Gtk.NamedAction.new("win.reload")))
 
         self.reload()
@@ -120,9 +120,14 @@ class LockInApp(Adw.Application):
         self.win = None
 
     def do_activate(self):
-        if self.win is None:
-            self.win = LockInWindow(application=self)
-        self.win.present()
+        try:
+            if self.win is None:
+                self.win = LockInWindow(application=self)
+            self.win.present()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 if __name__ == "__main__":
