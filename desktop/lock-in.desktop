@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Lock In
+GenericName=Todo & Pomodoro
+Comment=Personal performance software — for the dedicated few
+Exec=xdg-open http://localhost:8787/manage
+Icon=lock-in
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=todo;tasks;pomodoro;tracker;focus;lock in;
+StartupNotify=false
+Actions=overlay;card;
+
+[Desktop Action overlay]
+Name=Open OBS overlay
+Exec=xdg-open http://localhost:8787/
+
+[Desktop Action card]
+Name=Export today (retro card)
+Exec=xdg-open "http://localhost:8787/card.png?style=retro"
