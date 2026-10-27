@@ -606,14 +606,14 @@ def tracker_payload(conn) -> dict:
                 "SELECT * FROM tracker_subjects WHERE group_id=? ORDER BY position, id", (g["id"],)
             )
         ]
-        counted = [s for s in subs if s["state"] != "dropped"]
+        counted = [s for s in subs if s["state"] not in ("dropped", "paused")]
         done_n = sum(s["state"] == "done" for s in counted)
         for s in subs:
             if s["state"] == "doing":
                 totals["active"] += 1
             if s["stale"]:
                 totals["stale"] += 1
-            if s["state"] != "dropped" and s["unit_total"] is not None:
+            if s["state"] not in ("dropped", "paused") and s["unit_total"] is not None:
                 totals["units_left"] += max(0, s["unit_total"] - s["unit_done"])
             totals["focused_min"] += s["focused_min"]
         groups.append({
@@ -864,9 +864,9 @@ def _card_render(big: str, small: str, retro: bool = False, label: str = "") -> 
         d.line([(34, band_top), (W - 34, band_top)], fill="#f2ae5c", width=2)
         d.line([(34, band_bot - 4), (W - 34, band_bot - 4)], fill="#5c3100", width=4)
 
-        f_brand = _retro_font(46)
+        f_brand = _retro_font(42)
         f_label = _retro_font(26)
-        d.text((64, (band_top + band_bot) / 2), "GRIND", font=f_brand, fill="#1c0e00", anchor="lm")
+        d.text((64, (band_top + band_bot) / 2), "LOCK IN", font=f_brand, fill="#1c0e00", anchor="lm")
         if label:
             d.text((W - 64, (band_top + band_bot) / 2), label, font=f_label, fill="#3a1e00", anchor="rm")
 
@@ -890,7 +890,7 @@ def _card_render(big: str, small: str, retro: bool = False, label: str = "") -> 
         d.text((W / 2, cy + 300), small, font=f_small, fill="#c4bfb4", anchor="mm")
 
         f_foot = _retro_font(20)
-        d.text((W / 2, H - 90), "GRIND SOFTWARE  ·  EST. 1998", font=f_foot, fill="#45413a", anchor="mm")
+        d.text((W / 2, H - 90), "LOCK IN SOFTWARE  ·  EST. 1998", font=f_foot, fill="#45413a", anchor="mm")
 
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -945,7 +945,7 @@ PAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>grind overlay</title>
+<title>lock in overlay</title>
 <style>
 __FONTS_CSS__
   html, body {
@@ -968,7 +968,7 @@ __FONTS_CSS__
     flex-direction: column;
   }
   #card::before {
-    content: "GRIND";
+    content: "LOCK IN";
     display: block;
     margin: 0 -14px 10px;
     padding: 5px 14px 4px;
@@ -1159,7 +1159,7 @@ MANAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>grind</title>
+<title>lock in</title>
 <style>
 __FONTS_CSS__
   :root { color-scheme: dark; }
@@ -1174,22 +1174,25 @@ __FONTS_CSS__
     font-size: 12px;
   }
 
-  /* ---------- navbar ---------- */
+  /* ---------- masthead + navbar ---------- */
+  #mast { display: flex; align-items: flex-end; gap: 16px; padding: 20px 2px 12px; }
+  .brand {
+    font-family: "Archivo Black", "Arial Black", sans-serif;
+    font-size: 30px; font-weight: 400;
+    text-transform: uppercase; letter-spacing: 0;
+    color: #d97a10; line-height: 0.9;
+    text-shadow: 0 1px 0 #8a4d00, 0 2px 0 #553000, 0 3px 2px rgba(0, 0, 0, 0.9), 0 0 18px rgba(204, 110, 0, 0.25);
+  }
+  .tag { font-size: 11px; color: #7d786e; line-height: 1.5; font-style: italic; padding-bottom: 3px; }
+  .tag b { color: #c98d3f; font-style: normal; }
+  .ver { margin-left: auto; font-size: 10px; color: #5a564c; text-align: right; line-height: 1.6; padding-bottom: 3px; }
   .nav {
     display: flex; align-items: center;
-    margin: 0 -22px 4px; padding: 0 22px;
+    margin: 0 -22px 4px; padding: 0 12px;
     background: linear-gradient(180deg, #1c1913 0%, #12100b 100%);
     border-top: 1px solid #322d22;
     border-bottom: 3px solid #a85e00;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
-  }
-  .brand {
-    font-family: "Archivo Black", "Arial Black", sans-serif;
-    font-size: 21px; font-weight: 400;
-    text-transform: uppercase; letter-spacing: 1px;
-    color: #d97a10;
-    text-shadow: 0 1px 0 #8a4d00, 0 2px 0 #553000, 0 3px 2px rgba(0, 0, 0, 0.9);
-    margin-right: 22px;
   }
   .nlinks button {
     background: none; border: none; border-right: 1px solid #26221a; cursor: pointer;
@@ -1220,6 +1223,26 @@ __FONTS_CSS__
     box-shadow: inset 0 1px 0 rgba(255, 190, 110, 0.12);
   }
   .btitle .rt { font-weight: 400; letter-spacing: 1px; color: #b98a4a; }
+
+  /* ---------- collapsed bronze sections (log) ---------- */
+  details.logdrop > summary {
+    display: flex; align-items: center; justify-content: space-between;
+    list-style: none; cursor: pointer;
+    margin: -10px -14px;
+    padding: 5px 10px;
+    background: linear-gradient(180deg, #43301a 0%, #2b1e0e 55%, #241808 100%);
+    color: #eda44f;
+    font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase;
+    text-shadow: 0 1px 1px #000;
+    border-top: 1px solid #5f4626;
+    border-bottom: 1px solid #120c05;
+    box-shadow: inset 0 1px 0 rgba(255, 190, 110, 0.12);
+  }
+  details.logdrop > summary::-webkit-details-marker { display: none; }
+  details.logdrop > summary::after { content: "\25B6"; font-size: 9px; color: #b98a4a; }
+  details.logdrop[open] > summary { margin-bottom: 10px; }
+  details.logdrop[open] > summary::after { content: "\25BE"; }
+  details.logdrop > .inner { padding: 0; }
 
   /* ---------- boxes ---------- */
   .card {
@@ -1294,23 +1317,27 @@ __FONTS_CSS__
   .task[draggable="true"] { cursor: grab; }
   .task[draggable="true"]:active { cursor: grabbing; }
   .task:last-child { border-bottom: none; }
-  .row { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
-  .statebtn {
-    flex: none; width: 28px; height: 28px; border-radius: 0;
-    border: 1px solid; border-color: #050403 #3a352a #3a352a #050403;
-    background: #0f0d0a; cursor: pointer; font-size: 14px;
+  .row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; margin: 0 -14px; }
+  .task.alt .row { background: #1a1814; }
+  #list .task:hover .row { background: #221e17; }
+  .glyph {
+    flex: none; width: 22px; text-align: center; cursor: pointer; user-select: none;
     font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 700;
-    box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.5);
+    font-size: 15px; line-height: 1;
   }
-  .todo .statebtn { color: #5a564c; }
-  .doing .statebtn { color: #e0820f; text-shadow: 0 0 7px rgba(204, 110, 0, 0.55); }
-  .done .statebtn { color: #6e675a; }
+  .todo .glyph { color: #5a564c; }
+  .doing .glyph { color: #e0820f; text-shadow: 0 0 7px rgba(204, 110, 0, 0.55); animation: pulse 1.6s ease-in-out infinite; }
+  .done .glyph { color: #4a463c; }
+  .paused .glyph, .glyph.hold { color: #c9a26a; }
+  .dropped .glyph { color: #3f3b32; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
   .ttext { flex: 1; font-size: 13.5px; cursor: pointer; text-shadow: 0 1px 1px #000; }
   .todo .ttext { color: #9a948a; }
   .doing .ttext { color: #f0ead9; font-weight: 700; }
   .done .ttext { color: #5a564c; text-decoration: line-through; }
   .hasnotes { font-size: 10px; color: #d98d2a; margin-left: 6px; }
-  .delbtn { background: none; border: none; color: #5a564c; cursor: pointer; font-size: 14px; }
+  .delbtn { background: none; border: none; color: #5a564c; cursor: pointer; font-size: 14px; opacity: 0.35; }
+  .task:hover .delbtn, table.t tr:hover td .delbtn { opacity: 1; }
   .delbtn:hover { color: #e06a3a; }
   .editor { padding: 4px 0 14px 38px; display: none; }
   .editor.open { display: block; }
@@ -1337,23 +1364,8 @@ __FONTS_CSS__
   .catrow { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
   .catrow input[type=text] { flex: 1; min-width: 0; margin-bottom: 0; }
   .catrow .tool { flex: none; padding: 6px 9px; }
-  .tviewtabs { display: flex; gap: 3px; margin: 14px 0 0; }
-  .tviewtab {
-    background: linear-gradient(180deg, #26221a 0%, #1a1712 100%);
-    border: 1px solid #363127; border-bottom: none;
-    color: #8a8478; cursor: pointer; font-size: 12px;
-    padding: 5px 14px 6px; border-radius: 0; font-family: inherit;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  }
-  .tviewtab:hover { color: #e8dcc8; }
-  .tviewtab.cur {
-    background: linear-gradient(180deg, #e0820f 0%, #a85a00 100%);
-    border-color: #f2ae5c #5c3100 #a85a00 #f2ae5c;
-    color: #1c0e00; font-weight: 700;
-    text-shadow: 0 1px 0 rgba(255, 200, 120, 0.45);
-  }
   #notebox {
-    width: 100%; box-sizing: border-box; min-height: 55vh;
+    width: 100%; box-sizing: border-box; min-height: 150px;
     background: none; border: none; outline: none; resize: vertical;
     box-shadow: none;
     color: #cfc9be; font-size: 13px; line-height: 1.7;
@@ -1523,7 +1535,9 @@ __FONTS_CSS__
   .gbody { padding: 0 12px 8px; border-top: 1px solid #1e1b15; border-radius: 0; }
   .subj { border-bottom: 1px solid #1e1b15; position: relative; }
   .subj:last-of-type { border-bottom: none; }
-  .srow { display: flex; align-items: center; gap: 7px; padding: 5px 0; }
+  .srow { display: flex; align-items: center; gap: 7px; padding: 5px 12px; margin: 0 -12px; }
+  .subj.alt .srow { background: #1a1814; }
+  .subj:hover .srow { background: #221e17; }
   .srow[draggable="true"] { cursor: grab; }
   .srow[draggable="true"]:active { cursor: grabbing; }
   .star { background: none; border: none; cursor: pointer; color: #45413a; font-size: 13px; padding: 0; width: 16px; flex: none; line-height: 1; opacity: 0.35; }
@@ -1541,7 +1555,7 @@ __FONTS_CSS__
   .dropped .sname { color: #45413a; text-decoration: line-through; }
   .slink { color: #5a564c; text-decoration: none; font-size: 11px; margin-left: 5px; }
   .slink:hover { color: #d98d2a; }
-  .subj .statebtn { width: 22px; height: 22px; font-size: 12px; }
+  .subj .glyph { width: 20px; font-size: 13px; }
   .badge {
     font-size: 9.5px; padding: 1px 7px; border-radius: 0; font-weight: 700;
     cursor: pointer; white-space: nowrap; flex: none; font-family: inherit;
@@ -1592,8 +1606,12 @@ __FONTS_CSS__
 </style>
 </head>
 <body>
+<div id="mast">
+  <span class="brand">LOCK IN</span>
+  <span class="tag"><b>personal performance software</b><br>for the dedicated few.</span>
+  <span class="ver">v1.0 &middot; build 1998<br>shareware &mdash; register today</span>
+</div>
 <nav class="nav">
-  <span class="brand">grind</span>
   <span class="nlinks">
     <button data-v="tasks" class="cur" onclick="switchView('tasks')">tasks</button>
     <button data-v="tracker" onclick="switchView('tracker')">tracker</button>
@@ -1604,22 +1622,21 @@ __FONTS_CSS__
 </nav>
 
 <div id="view-tasks">
-  <div class="tviewtabs">
-    <button class="tviewtab cur" data-tt="tasks" onclick="switchTaskTab('tasks')">tasks</button>
-    <button class="tviewtab" data-tt="text" onclick="switchTaskTab('text')">text</button>
-  </div>
   <div class="card">
-    <div class="btitle"><span>&raquo; tasks</span><span class="rt">grind &middot; est. 1998</span></div>
+    <div class="btitle"><span>&raquo; tasks</span><span class="rt" id="taskcount"></span></div>
     <div id="list"></div>
-    <div id="notewrap" class="hidden">
-      <textarea id="notebox" placeholder="lock tf in bum ahh lil ugly ahh boi" oninput="noteChanged()"></textarea>
-      <div class="noterow"><span class="saved" id="notesaved">saved &#10003;</span></div>
-    </div>
     <div class="addbar hidden" id="addbar">
       <input type="text" id="newtext" placeholder="new task... (Enter)" onkeydown="taskKey(event)">
       <button class="tool pri" onclick="addTask()">add</button>
     </div>
     <button class="tool addreveal" id="addreveal" title="add task" onclick="revealAdd()">&#43;</button>
+  </div>
+  <div class="card">
+    <div class="btitle"><span>&raquo; day notes</span><span class="rt">lock the fuck in lil bitch</span></div>
+    <div id="notewrap">
+      <textarea id="notebox" placeholder="one goal. lock in." oninput="noteChanged()"></textarea>
+      <div class="noterow"><span class="saved" id="notesaved">saved &#10003;</span></div>
+    </div>
   </div>
 </div>
 
@@ -1668,11 +1685,6 @@ __FONTS_CSS__
 
 <div id="view-summary" class="hidden">
   <div class="statsgrid" id="statgrid"></div>
-  <div class="prow" style="margin:18px 0 8px; align-items:center; gap:6px">
-    <span class="ctitle" style="margin:0">tracker</span>
-    <button class="twisty" id="trktwist" onclick="toggleTrkStats()">&#9656;</button>
-  </div>
-  <div class="statsgrid" id="trkstatgrid" style="margin-bottom:16px"></div>
   <div class="card" style="position:relative">
     <div class="btitle"><span>&raquo; summary</span><span class="rt">export via &#8943;</span></div>
     <button class="kebab cardkebab" title="export" onclick="toggleCardMenu(event)">&#8943;</button>
@@ -1696,19 +1708,23 @@ __FONTS_CSS__
 </div>
 
 <div id="view-log" class="hidden">
-  <div class="card">
-    <div class="ctitle">import from pomofocus</div>
-    <textarea class="ta" id="imptext" placeholder="23-Sep-2026&#10;14:39 ~ 16:56&#10;clickhouse&#10;113"></textarea>
-    <div class="prow">
-      <button class="tool" onclick="doImport(true)">preview</button>
-      <button class="tool pri" onclick="doImport(false)">import</button>
+  <details class="card logdrop">
+    <summary>&raquo; import from pomofocus</summary>
+    <div class="inner">
+      <textarea class="ta" id="imptext" placeholder="23-Sep-2026&#10;14:39 ~ 16:56&#10;clickhouse&#10;113"></textarea>
+      <div class="prow">
+        <button class="tool" onclick="doImport(true)">preview</button>
+        <button class="tool pri" onclick="doImport(false)">import</button>
+      </div>
+      <div class="imp" id="impout"></div>
     </div>
-    <div class="imp" id="impout"></div>
-  </div>
-  <div class="card" style="margin-top:12px">
-    <div class="ctitle">periods</div>
-    <div id="logtable" style="max-height:480px; overflow-y:auto"></div>
-  </div>
+  </details>
+  <details class="card logdrop">
+    <summary>&raquo; periods</summary>
+    <div class="inner">
+      <div id="logtable" style="max-height:480px; overflow-y:auto"></div>
+    </div>
+  </details>
 </div>
 
 <div id="view-tracker" class="hidden">
@@ -1769,28 +1785,45 @@ __FONTS_CSS__
     renderTasks();
   }
 
+  const TASK_CAP = 4;
+  let tasksExpanded = localStorage.getItem("lockin_tasks_expanded") === "1";
+
   function renderTasks() {
+    const open = tasks.filter(t => t.state !== "done");
+    const done = tasks.filter(t => t.state === "done");
+    $("taskcount").textContent = tasks.length ? `${done.length}/${tasks.length} done` : "";
     const list = $("list");
     if (!tasks.length) {
       list.innerHTML = `<div class="empty">no tasks yet</div>`;
       return;
     }
-    const open = tasks.filter(t => t.state !== "done");
-    const done = tasks.filter(t => t.state === "done");
-    let html = open.map(taskHtml).join("");
+    let z = 0, html = "";
+    const visible = tasksExpanded ? open : open.slice(0, TASK_CAP);
+    html += visible.map(t => taskHtml(t, z++)).join("");
+    if (open.length > TASK_CAP) {
+      html += `<div class="donehead" onclick="toggleTasksExpand()">` +
+        `<span class="arrow">${tasksExpanded ? "&#9662;" : "&#9656;"}</span> ` +
+        (tasksExpanded ? `show fewer tasks` : `show more (${open.length - TASK_CAP} hidden)`) + `</div>`;
+    }
     if (done.length) {
       html += `<div class="donehead" onclick="toggleDone()">` +
         `<span class="arrow">${doneCollapsed ? "&#9656;" : "&#9662;"}</span> done (${done.length})</div>`;
-      if (!doneCollapsed) html += done.map(taskHtml).join("");
+      if (!doneCollapsed) html += done.map(t => taskHtml(t, z++)).join("");
     }
     list.innerHTML = html;
   }
 
-  function taskHtml(t) {
+  function toggleTasksExpand() {
+    tasksExpanded = !tasksExpanded;
+    localStorage.setItem("lockin_tasks_expanded", tasksExpanded ? "1" : "0");
+    renderTasks();
+  }
+
+  function taskHtml(t, z = 0) {
     return `
-      <div class="task ${t.state}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)">
+      <div class="task ${t.state}${z % 2 ? " alt" : ""}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)">
         <div class="row">
-          <button class="statebtn" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</button>
+          <span class="glyph" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</span>
           <span class="ttext" onclick="toggleEditor(${t.id})">${esc(t.text)}${t.details ? '<span class="hasnotes">&#9998;</span>' : ""}</span>
           <button class="delbtn" onclick="delTask(${t.id})">&#10005;</button>
         </div>
@@ -1839,17 +1872,7 @@ __FONTS_CSS__
     await load(true);
   }
 
-  let taskTab = "tasks", noteTimer = null, noteLoaded = false;
-  function switchTaskTab(mode) {
-    taskTab = mode;
-    document.querySelectorAll(".tviewtab").forEach(b => b.classList.toggle("cur", b.dataset.tt === mode));
-    const isTasks = mode === "tasks";
-    $("list").classList.toggle("hidden", !isTasks);
-    $("notewrap").classList.toggle("hidden", isTasks);
-    $("addreveal").classList.toggle("hidden", !isTasks);
-    if (isTasks) { hideAdd(); renderTasks(); }
-    else { hideAdd(); loadNote(); }
-  }
+  let noteTimer = null, noteLoaded = false;
   function revealAdd() {
     $("addreveal").classList.add("hidden");
     $("addbar").classList.remove("hidden");
@@ -1858,7 +1881,7 @@ __FONTS_CSS__
   function hideAdd() {
     $("addbar").classList.add("hidden");
     $("newtext").value = "";
-    if (taskTab === "tasks") $("addreveal").classList.remove("hidden");
+    $("addreveal").classList.remove("hidden");
   }
   function taskKey(ev) {
     if (ev.key === "Enter") addTask();
@@ -2098,10 +2121,6 @@ __FONTS_CSS__
     drawDaily($("ch-daily"), s.daily_categories);
     drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
     drawMonthRows($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
-    api("/api/tracker").then(t => {
-      trkTotals = t.totals;
-      renderTrkStats();
-    }).catch(() => {});
   }
   function toggleCardMenu(ev) {
     ev.stopPropagation();
@@ -2115,24 +2134,16 @@ __FONTS_CSS__
     const base = kind === "day" ? "/card.png" : kind === "week" ? "/card-week.png" : "/card-month.png";
     window.open(style === "retro" ? base + "?style=retro" : base, "_blank");
   }
-  let trkStatsOpen = false, trkTotals = null;
-  function renderTrkStats() {
-    if (!trkTotals) return;
-    const all = [
-      [trkTotals.active, "in progress"],
-      [trkTotals.stale, "flagged stale"],
-      [fmtHM(trkTotals.focused_min), "invested"],
-    ];
-    const show = trkStatsOpen ? all : [];
-    $("trkstatgrid").innerHTML = show.map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
-    $("trktwist").innerHTML = trkStatsOpen ? "&#9662;" : "&#9656;";
+  const PALETTE = ["#e0820f", "#8a9a4a", "#6a8aa0", "#c05a3a", "#c9a26a", "#9a6a8a", "#7a8478", "#b8862a", "#5a7a6a", "#a05a5a"];
+  function nameColor(name) {
+    let h = 0;
+    for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return PALETTE[h % PALETTE.length];
   }
-  function toggleTrkStats() { trkStatsOpen = !trkStatsOpen; renderTrkStats(); }
   function drawDaily(el, days) {
     const cats = [];
     days.forEach(d => d.cats.forEach(c => { if (!cats.includes(c.name)) cats.push(c.name); }));
-    const shades = ["#e0820f", "#a85a00", "#8a8478", "#5a564c", "#c98d3f", "#7a4200", "#f2ae5c", "#363127"];
-    const shade = name => shades[cats.indexOf(name) % shades.length];
+    const shade = nameColor;
     const legend = cats.length
       ? `<div class="legend">` + cats.map(c => `<span><i style="background:${shade(c)}"></i>${esc(c)}</span>`).join("") + `</div>`
       : `<div class="empty" style="padding:4px 0">no focus in the last 7 days</div>`;
@@ -2229,6 +2240,7 @@ __FONTS_CSS__
   let trkCollapsed = JSON.parse(localStorage.getItem("obstodo_trk_collapsed") || "[]");
   let trkDoneCollapsed = localStorage.getItem("obstodo_trk_done") !== "0";
   let trkDropCollapsed = localStorage.getItem("obstodo_trk_drop") !== "0";
+  let trkHoldCollapsed = localStorage.getItem("lockin_trk_hold") !== "0";
   const TSTATE_GLYPH = {todo: "&#9675;", doing: "&#9679;", done: "&#10003;", paused: "&#10073;&#10073;", dropped: "&#10005;"};
 
   function fmtDate(iso) {
@@ -2304,13 +2316,19 @@ __FONTS_CSS__
     const collapsed = trkCollapsed.includes(g.id);
     let body = "";
     if (!collapsed) {
-      const openSubs = g.subjects.filter(s => s.state !== "done" && s.state !== "dropped");
+      const openSubs = g.subjects.filter(s => s.state !== "done" && s.state !== "dropped" && s.state !== "paused");
       const doneSubs = g.subjects.filter(s => s.state === "done");
+      const holdSubs = g.subjects.filter(s => s.state === "paused");
       const dropSubs = g.subjects.filter(s => s.state === "dropped");
-      body = openSubs.map(s => subjectHtml(g, s)).join("");
+      let z = 0;
+      body = openSubs.map(s => subjectHtml(g, s, z++)).join("");
+      if (holdSubs.length) {
+        body += `<div class="donehead" onclick="toggleTrkHold()"><span class="arrow">${trkHoldCollapsed ? "&#9656;" : "&#9662;"}</span> on hold (${holdSubs.length})</div>`;
+        if (!trkHoldCollapsed) body += holdSubs.map(s => subjectHtml(g, s, z++)).join("");
+      }
       if (doneSubs.length) {
         body += `<div class="donehead" onclick="toggleTrkDone()"><span class="arrow">${trkDoneCollapsed ? "&#9656;" : "&#9662;"}</span> done (${doneSubs.length})</div>`;
-        if (!trkDoneCollapsed) body += doneSubs.map(s => subjectHtml(g, s)).join("");
+        if (!trkDoneCollapsed) body += doneSubs.map(s => subjectHtml(g, s, z++)).join("");
       }
       if (dropSubs.length) {
         body += `<div class="donehead" onclick="toggleTrkDrop()"><span class="arrow">${trkDropCollapsed ? "&#9656;" : "&#9662;"}</span> dropped (${dropSubs.length})</div>`;
@@ -2349,7 +2367,7 @@ __FONTS_CSS__
     $(`addbtn-${gid}`).classList.remove("hidden");
   }
 
-  function subjectHtml(g, s) {
+  function subjectHtml(g, s, z = 0) {
     const open = trkEditorId === s.id;
     let badge = "";
     if (s.state === "paused") {
@@ -2360,7 +2378,7 @@ __FONTS_CSS__
       badge = `<span class="badge zzz" title="${esc(s.snooze_reason || "flag snoozed")}">zzz until ${fmtDate(s.snooze_until)}</span>`;
     }
     const star = `<button class="star ${s.is_next ? "on" : ""}" title="${s.is_next ? "unstar (next up)" : "mark as next up"}" onclick="toggleNext(${s.id}, ${s.is_next ? 0 : 1}, event)">${s.is_next ? "&#9733;" : "&#9734;"}</button>`;
-    const stateBtn = `<button class="statebtn" title="${s.state}, click to cycle" onclick="cycleSubjState(${s.id}, '${s.state}', event)">${TSTATE_GLYPH[s.state] || "&#9675;"}</button>`;
+    const stateGlyph = `<span class="glyph" title="${s.state}, click to cycle" onclick="cycleSubjState(${s.id}, '${s.state}', event)">${TSTATE_GLYPH[s.state] || "&#9675;"}</span>`;
     const link = s.url ? `<a class="slink" href="${esc(s.url)}" target="_blank" rel="noopener" title="open resource">&#8599;</a>` : "";
     const kebab = `<button class="kebab" title="more" onclick="toggleSubjMenu(${s.id}, event)">&#8943;</button>`;
     const snoozeBar = trkSnoozeId === s.id
@@ -2372,9 +2390,9 @@ __FONTS_CSS__
           ${s.snoozed ? `<button class="qadd" onclick="unsnoozeSubj(${s.id}, event)">clear</button>` : ""}
         </div>`
       : "";
-    return `<div class="subj ${s.state}">
+    return `<div class="subj ${s.state}${z % 2 ? " alt" : ""}">
       <div class="srow" draggable="true" ondragstart="sDragStart(${s.id}, event)" ondragover="sDragOver(event)" ondrop="sDrop(${g.id}, ${s.id}, event)">
-        ${star}${stateBtn}
+        ${star}${stateGlyph}
         <span class="sname" onclick="toggleSubjEditor(${s.id})">${esc(s.name)}${link}</span>
         ${badge}
         ${kebab}
@@ -2542,6 +2560,11 @@ __FONTS_CSS__
     trkSnoozeId = null;
     await loadTracker();
   }
+  function toggleTrkHold() {
+    trkHoldCollapsed = !trkHoldCollapsed;
+    localStorage.setItem("lockin_trk_hold", trkHoldCollapsed ? "1" : "0");
+    renderTracker();
+  }
   function toggleTrkDone() {
     trkDoneCollapsed = !trkDoneCollapsed;
     localStorage.setItem("obstodo_trk_done", trkDoneCollapsed ? "1" : "0");
@@ -2611,6 +2634,7 @@ __FONTS_CSS__
   });
 
   load();
+  loadNote();
   startPomoPoll();
 </script>
 </body>
