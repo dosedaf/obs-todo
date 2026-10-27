@@ -3,12 +3,13 @@ Type=Application
 Name=Lock In
 GenericName=Todo & Pomodoro
 Comment=Personal performance software — for the dedicated few
-Exec=xdg-open http://localhost:8787/manage
+Exec=/usr/bin/python3 /home/yoda/projects/obs-todo/desktop/lockin-app.py
 Icon=lock-in
 Terminal=false
 Categories=Office;ProjectManagement;
 Keywords=todo;tasks;pomodoro;tracker;focus;lock in;
-StartupNotify=false
+StartupNotify=true
+StartupWMClass=LockIn
 Actions=overlay;card;
 
 [Desktop Action overlay]
