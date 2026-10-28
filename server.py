@@ -947,7 +947,7 @@ PAGE = """<!doctype html>
 <style>
 html, body {
     margin: 0;
-    background: transparent;
+    background: #281800 url("__CERAMIC__") repeat;
     font-family: verdana, "trebuchet ms", arial, helvetica, sans-serif;
     color: #d8a248;
   }
@@ -964,38 +964,22 @@ html, body {
     display: flex;
     flex-direction: column;
   }
-  #card::before {
-    content: "lock in";
-    display: block;
-    margin: 0 0 6px;
-    padding: 0;
-    background: none;
-    color: #d8a248;
-    font-family: inherit;
-    font-size: 15px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    text-shadow: none;
-    box-shadow: none;
-  }
-
-  .stats {
+  .top {
+    flex: none;
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    font-size: 11px;
-    font-style: italic;
-    color: #a87830;
-    background: none;
-    border: none;
-    padding: 0 0 6px;
-    margin-bottom: 2px;
+    gap: 12px;
+    padding: 0 2px 8px;
+    border-bottom: 1px solid #4a2a00;
   }
+  .top .brand2 { font-size: 15px; font-weight: 700; letter-spacing: 1px; color: #d8a248; text-shadow: none; }
+  .top .tstats { font-size: 11px; font-style: italic; color: #a87830; }
 
   .pomo {
     text-align: center;
-    padding: 10px 0 8px;
-    margin-bottom: 2px;
+    padding: 18px 0 12px;
+    margin-bottom: 4px;
   }
   .ptime {
     font-size: 44px;
@@ -1132,10 +1116,14 @@ html, body {
       deadline = Date.now() + pomo.remaining_ms;
       if (pomo.ended && prevEnded === false) bell();
       const pct = data.stats.total ? Math.round(100 * data.stats.done / data.stats.total) : 0;
+      const shown = data.items
+        .filter(i => i.state !== "done")
+        .sort((a, b) => (b.state === "doing") - (a.state === "doing"))
+        .slice(0, 4);
       let html = `
-        <div class="stats"><span>${data.stats.done} / ${data.stats.total} done</span><span>${pct}%</span></div>
+        <div class="top"><span class="brand2">lock tf in</span><span class="tstats">${data.stats.done} / ${data.stats.total} done &middot; ${pct}%</span></div>
         ${pomoHtml()}
-        <div class="listwrap"><ul>` + data.items.filter(i => i.state !== "done").map(i =>
+        <div class="listwrap"><ul>` + shown.map(i =>
           `<li class="${i.state}"><span class="box">&middot;</span><span class="label">${esc(i.text)}</span></li>`
         ).join("") + `</ul></div>
         <div class="pfoot">${pfootHtml()}</div>`;
@@ -1370,14 +1358,10 @@ MANAGE = """<!doctype html>
   }
   .stat b { display: inline; font-size: 13px; font-weight: 700; color: #f0d0a0; font-family: inherit; text-shadow: none; }
   .stat span { display: inline; font-size: 11px; color: #a87830; font-style: italic; margin: 0 2px 0 4px; text-transform: none; letter-spacing: 0; }
-  .stat::after { content: " \00B7  "; color: #8a5a10; }
+  .stat::after { content: " ·  "; color: #8a5a10; }
   .statline { margin: 3px 0 0 16px; font-size: 13px; }
   .statline b { color: #f0d0a0; font-weight: 700; }
-  .cardkebab { position: static; font-size: 13px; z-index: auto; }
-  .cardmenu { top: auto; right: auto; min-width: 170px; }
-  .focusline { font-size: 14px; color: #f0d0a0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .focusline.dim { color: #8a6228; }
-  .focusinput { flex: 1; min-width: 0; background: transparent; border: none; outline: none; border-bottom: 1px solid #6a4a10; color: #f0d0a0; font-size: 14px; font-family: inherit; padding: 2px 0; }
+  .taskmenu { position: fixed; top: 0; left: 0; right: auto; z-index: 100; }
 
   /* ---------- tracker: indented text ---------- */
   .group { border: none; background: none; box-shadow: none; margin: 0 0 22px; }
@@ -1458,9 +1442,9 @@ MANAGE = """<!doctype html>
 </head>
 <body>
 <div id="mast">
-  <span class="brand">lock in</span>
-  <span class="tag"><b>personal performance software</b><br>for the dedicated few.</span>
-  <span class="ver">v1.0 &middot; build 1998<br>shareware &mdash; register today</span>
+  <span class="brand">lock tf in</span>
+  <span class="tag"><b>est. black mesa research facility.</b></span>
+  <span class="ver">v1.0 &middot; build 1998<br><span id="hlwords">&nbsp;</span></span>
 </div>
 <nav class="nav">
   <span class="nlinks">
@@ -1535,26 +1519,16 @@ MANAGE = """<!doctype html>
 </div>
 
 <div id="view-summary" class="hidden">
-  <div class="statsgrid" id="statgrid"></div>
-  <div class="card" style="position:relative">
-    <div class="btitle"><span>summary</span><span class="rt">export via &#8943;</span></div>
-    <button class="kebab cardkebab" title="export" onclick="toggleCardMenu(event)">&#8943;</button>
-    <div class="menu cardmenu" id="cardmenu" hidden>
-      <div class="menuhead">classic</div>
-      <button class="menuitem" onclick="exportCard('day')">export today</button>
-      <button class="menuitem" onclick="exportCard('week')">export this week</button>
-      <button class="menuitem" onclick="exportCard('month')">export this month</button>
-      <div class="menuhead" style="margin-top:6px">retro 1998</div>
-      <button class="menuitem" onclick="exportCard('day','retro')">export today</button>
-      <button class="menuitem" onclick="exportCard('week','retro')">export this week</button>
-      <button class="menuitem" onclick="exportCard('month','retro')">export this month</button>
-    </div>
+  <div class="card">
+    <div class="btitle"><span>summary</span></div>
+    <div class="statsgrid" id="statgrid"></div>
     <div class="ctitle">last 7 days by category</div>
     <div id="ch-daily"></div>
     <div class="ctitle" style="margin-top:22px">weekly</div>
     <div class="bars" id="ch-weeks"></div>
     <div class="ctitle" style="margin-top:22px">monthly</div>
     <div id="ch-months"></div>
+    <div class="statline" style="margin:26px 0 4px">export: <a href="/card.png" target="_blank">today</a> &middot; <a href="/card-week.png" target="_blank">week</a> &middot; <a href="/card-month.png" target="_blank">month</a> &mdash; retro: <a href="/card.png?style=retro" target="_blank">today</a> &middot; <a href="/card-week.png?style=retro" target="_blank">week</a> &middot; <a href="/card-month.png?style=retro" target="_blank">month</a></div>
   </div>
 </div>
 
@@ -1580,11 +1554,19 @@ MANAGE = """<!doctype html>
 
 <div id="view-tracker" class="hidden">
   <div class="prow" style="margin-bottom:12px; align-items:center">
-    <span id="trkfocus" class="focusline" ondblclick="editFocus()"></span>
     <span style="flex:1"></span>
     <button class="tool pri" title="add group" onclick="addGroup()">+</button>
   </div>
   <div id="trkgroups"></div>
+</div>
+
+<div class="menu taskmenu" id="taskmenu" hidden>
+  <div class="menuhead">set state</div>
+  <button class="menuitem" onclick="setTaskState(taskMenuId,'doing')">working on it</button>
+  <button class="menuitem" onclick="setTaskState(taskMenuId,'todo')">not working on it</button>
+  <button class="menuitem" onclick="setTaskState(taskMenuId,'done')">done</button>
+  <div class="menuhead" style="margin-top:6px">task</div>
+  <button class="menuitem danger" onclick="closeTaskMenu(); delTask(taskMenuId)">delete</button>
 </div>
 
 <script>
@@ -1672,7 +1654,7 @@ MANAGE = """<!doctype html>
 
   function taskHtml(t, z = 0) {
     return `
-      <div class="task ${t.state}${z % 2 ? " alt" : ""}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)">
+      <div class="task ${t.state}${z % 2 ? " alt" : ""}" draggable="true" ondragstart="onDragStart(${t.id}, event)" ondragover="onDragOver(event)" ondrop="onDrop(${t.id}, event)" oncontextmenu="taskMenu(${t.id}, event)">
         <div class="row">
           <span class="glyph" title="cycle state" onclick="cycleState(${t.id},'${t.state}')">${GLYPH[t.state]}</span>
           <span class="ttext" onclick="toggleEditor(${t.id})">${esc(t.text)}${t.details ? '<span class="hasnotes">&#9998;</span>' : ""}</span>
@@ -1704,6 +1686,24 @@ MANAGE = """<!doctype html>
   async function cycleState(id, state) {
     const next = {todo: "doing", doing: "done", done: "todo"}[state];
     await api(`/api/tasks/${id}`, "PATCH", {state: next});
+    await load(true);
+  }
+
+  let taskMenuId = null;
+  function taskMenu(id, ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    taskMenuId = id;
+    const m = $("taskmenu");
+    m.hidden = false;
+    m.style.left = Math.min(ev.clientX, window.innerWidth - 180) + "px";
+    m.style.top = Math.min(ev.clientY, window.innerHeight - 150) + "px";
+    setTimeout(() => document.addEventListener("click", closeTaskMenu, {once: true}), 0);
+  }
+  function closeTaskMenu() { const m = $("taskmenu"); if (m) m.hidden = true; }
+  async function setTaskState(id, state) {
+    closeTaskMenu();
+    await api(`/api/tasks/${id}`, "PATCH", {state});
     await load(true);
   }
 
@@ -1973,18 +1973,6 @@ MANAGE = """<!doctype html>
     drawBars($("ch-weeks"), s.weeks.map(w => ({l: w.label, v: w.min})));
     drawMonthRows($("ch-months"), s.months.map(m => ({l: m.label, v: m.min})));
   }
-  function toggleCardMenu(ev) {
-    ev.stopPropagation();
-    const m = $("cardmenu");
-    m.hidden = !m.hidden;
-    if (!m.hidden) setTimeout(() => document.addEventListener("click", closeCardMenu, {once: true}), 0);
-  }
-  function closeCardMenu() { $("cardmenu").hidden = true; }
-  function exportCard(kind, style) {
-    closeCardMenu();
-    const base = kind === "day" ? "/card.png" : kind === "week" ? "/card-week.png" : "/card-month.png";
-    window.open(style === "retro" ? base + "?style=retro" : base, "_blank");
-  }
   function drawDaily(el, days) {
     const active = days.filter(d => d.total);
     if (!active.length) { el.innerHTML = `<div class="empty" style="padding:4px 0 4px 16px">no focus in the last 7 days</div>`; return; }
@@ -2083,50 +2071,7 @@ MANAGE = """<!doctype html>
   async function loadTracker() {
     trk = await api("/api/tracker");
     renderTracker();
-    renderFocus();
     if (trkEditorId !== null && !findSubj(trkEditorId)) trkEditorId = null;
-  }
-
-  function renderFocus() {
-    const el = $("trkfocus");
-    if (!el || el.querySelector("input")) return;
-    const f = (trk && trk.focus) || "";
-    el.textContent = f || "set the focus for this week...";
-    el.classList.toggle("dim", !f);
-  }
-  function editFocus() {
-    const el = $("trkfocus");
-    if (el.querySelector("input")) return;
-    const cur = (trk && trk.focus) || "";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "focusinput";
-    input.value = cur;
-    el.textContent = "";
-    el.classList.remove("dim");
-    el.appendChild(input);
-    input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
-    let done = false;
-    const finish = async save => {
-      if (done) return;
-      done = true;
-      const v = input.value.trim();
-      if (save && v !== cur) {
-        try {
-          await api("/api/tracker/settings", "POST", {focus: v});
-          if (trk) trk.focus = v;
-        } catch (e) {}
-      }
-      renderFocus();
-    };
-    input.addEventListener("keydown", e => {
-      e.stopPropagation();
-      if (e.key === "Enter") finish(true);
-      else if (e.key === "Escape") finish(false);
-    });
-    input.addEventListener("blur", () => finish(true));
-    input.addEventListener("click", e => e.stopPropagation());
   }
 
   function renderTracker() {
@@ -2457,6 +2402,17 @@ MANAGE = """<!doctype html>
     }
   });
 
+  // ---------- half-life flavor: fresh pair every load
+  const HL_PHRASES = [
+    "resonance cascade", "black mesa", "lambda complex", "xen borderworld",
+    "headcrab containment", "crowbar certified", "anomalous materials",
+    "unforeseen consequences", "hazard course", "surface tension",
+    "blast pit", "on a rail", "gordon freeman", "g-man sighted",
+    "hev mark iv", "sector c", "test chamber", "bounce path",
+    "station lambda", "vortigaunt approved", "nihilanth rising",
+  ];
+  $("hlwords").textContent = HL_PHRASES[Math.floor(Math.random() * HL_PHRASES.length)];
+
   load();
   loadNote();
   startPomoPoll();
@@ -2468,6 +2424,7 @@ ARROW_URI = "data:image/gif;base64," + ARROW_GIF_B64
 CERAMIC_URI = "data:image/gif;base64," + CERAMIC_GIF_B64
 
 PAGE = PAGE.replace("__ARROW__", ARROW_URI)
+PAGE = PAGE.replace("__CERAMIC__", CERAMIC_URI)
 MANAGE = MANAGE.replace("__ARROW__", ARROW_URI)
 MANAGE = MANAGE.replace("__CERAMIC__", CERAMIC_URI)
 
